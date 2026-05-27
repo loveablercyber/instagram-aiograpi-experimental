@@ -28,8 +28,8 @@ class RemoveSessionRequest(BaseModel):
 
 
 class InstagramLoginRequest(BaseModel):
-    username: str = Field(..., min_length=1)
-    password: SecretStr = Field(..., min_length=1)
+    username: str | None = None
+    password: SecretStr | None = None
     verificationCode: SecretStr | None = None
 
 

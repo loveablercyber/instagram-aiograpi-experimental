@@ -152,10 +152,14 @@ async def instagram_login(request: Request, body: InstagramLoginRequest) -> Inst
     settings = _settings(request)
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
+    username = body.username or settings.instagram_username
+    password = body.password.get_secret_value() if body.password else settings.instagram_password
+    if not username or not password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Instagram credentials are not configured")
     try:
         await instagram.login_future(
-            body.username,
-            body.password.get_secret_value(),
+            username,
+            password,
             {
                 "verificationCode": body.verificationCode.get_secret_value() if body.verificationCode else "",
             },
@@ -173,11 +177,13 @@ async def instagram_challenge_resolve(
     settings = _settings(request)
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
+    username = body.username or settings.instagram_username or None
+    password = body.password.get_secret_value() if body.password else settings.instagram_password or None
     try:
         await instagram.resolve_challenge_future(
             body.code.get_secret_value(),
-            username=body.username,
-            password=body.password.get_secret_value() if body.password else None,
+            username=username,
+            password=password,
         )
     except Exception as exc:
         raise _safe_instagram_exception(exc) from exc

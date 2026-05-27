@@ -141,6 +141,25 @@ def test_login_saves_real_settings_encrypted_and_validate_restores():
     assert "fake-real-sessionid-never-plaintext" not in str(raw)
 
 
+def test_login_can_use_render_configured_credentials_without_request_body_password():
+    settings: Settings = make_settings(
+        instagram_real_connection_enabled=True,
+        instagram_username="secondary_test",
+        instagram_password="temporary-password",
+    )
+    encryption = EncryptionService(settings.session_encryption_key)
+    store = MemorySessionStore(settings, encryption)
+    audit = AuditService()
+    instagram = InstagramClientService(settings, store, audit, client_factory=FakeAioClient)
+    app = create_app(settings=settings, session_store=store, audit=audit, instagram=instagram)
+
+    with TestClient(app) as client:
+        response = client.post("/internal/instagram/login", headers={"X-Internal-Token": TEST_TOKEN}, json={})
+
+    assert response.status_code == 200
+    assert "fake-real-sessionid-never-plaintext" not in str(store.documents["test_account_only"])
+
+
 def test_threads_messages_send_and_send_rate_limit_are_controlled():
     client, _store = _client_with_real_connection_enabled()
     headers = {"X-Internal-Token": TEST_TOKEN}

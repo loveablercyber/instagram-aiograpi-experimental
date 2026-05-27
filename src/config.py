@@ -117,7 +117,5 @@ class Settings:
                 raise ConfigError("INTERNAL_API_TOKEN must be configured with a non-placeholder secret")
             if not self.session_encryption_key or _looks_like_placeholder(self.session_encryption_key):
                 raise ConfigError("SESSION_ENCRYPTION_KEY must be configured with a non-placeholder Fernet key")
-        if self.instagram_password:
-            raise ConfigError("INSTAGRAM_PASSWORD must remain empty during Phase 1")
         if self.instagram_polling_enabled and not self.instagram_real_connection_enabled:
             raise ConfigError("Polling cannot be enabled while real Instagram connections are disabled")
