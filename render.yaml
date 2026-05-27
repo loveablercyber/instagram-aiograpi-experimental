@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: instagram-aiograpi-experimental
+    runtime: docker
+    plan: free
+    rootDir: integrations/instagram-aiograpi-experimental
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: experimental
+      - key: PORT
+        value: 8000
+      - key: INTERNAL_API_TOKEN
+        sync: false
+      - key: HEALTH_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: instagram_aiograpi_experimental
+      - key: MONGODB_SESSION_COLLECTION
+        value: instagram_experimental_sessions
+      - key: MONGODB_AUDIT_COLLECTION
+        value: instagram_experimental_audit
+      - key: MONGODB_MESSAGE_CACHE_COLLECTION
+        value: instagram_experimental_messages
+      - key: SESSION_ENCRYPTION_KEY
+        sync: false
+      - key: INSTAGRAM_REAL_CONNECTION_ENABLED
+        value: false
+      - key: INSTAGRAM_TEST_ACCOUNT_KEY
+        value: test_account_only
+      - key: INSTAGRAM_USERNAME
+        value: ""
+      - key: INSTAGRAM_PASSWORD
+        value: ""
+      - key: INSTAGRAM_POLLING_ENABLED
+        value: false
+      - key: INSTAGRAM_POLLING_INTERVAL_SECONDS
+        value: 60
+      - key: INSTAGRAM_MAX_MESSAGES_PER_FETCH
+        value: 20
+      - key: INSTAGRAM_MAX_SENDS_PER_HOUR
+        value: 5
+      - key: INSTAGRAM_PROXY_URL
+        value: ""
