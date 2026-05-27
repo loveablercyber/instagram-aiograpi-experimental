@@ -116,7 +116,10 @@ class MongoSessionStore:
 
     async def close(self) -> None:
         if self._client is not None and hasattr(self._client, "close"):
-            self._client.close()
+            maybe_awaitable = self._client.close()
+            if hasattr(maybe_awaitable, "__await__"):
+                await maybe_awaitable
+            self._client = None
 
 
 class MemorySessionStore:
