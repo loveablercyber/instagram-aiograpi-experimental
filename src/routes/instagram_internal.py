@@ -8,6 +8,7 @@ from src.config import Settings
 from src.dependencies import require_internal_auth
 from src.instagram_client import (
     InstagramAuthError,
+    InstagramAuthFlowError,
     InstagramChallengeRequiredError,
     InstagramOperationError,
     InstagramRiskStopError,
@@ -15,6 +16,7 @@ from src.instagram_client import (
 )
 from src.models import (
     InstagramActionResponse,
+    InstagramAuthResponse,
     InstagramChallengeResolveRequest,
     InstagramLoginRequest,
     InstagramLogoutRequest,
@@ -76,6 +78,10 @@ def _safe_instagram_exception(exc: Exception) -> HTTPException:
     if isinstance(exc, InstagramOperationError):
         return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Instagram operation failed")
     return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Instagram operation failed")
+
+
+def _auth_flow_response(exc: InstagramAuthFlowError) -> InstagramAuthResponse:
+    return InstagramAuthResponse(**exc.result.to_response())
 
 
 @router.get("/status", response_model=InternalStatusResponse)
@@ -147,8 +153,8 @@ async def delete_session(request: Request, body: RemoveSessionRequest) -> Sessio
     return SessionActionResponse(ok=removed, action="delete", accountKey=settings.instagram_test_account_key)
 
 
-@router.post("/instagram/login", response_model=InstagramActionResponse)
-async def instagram_login(request: Request, body: InstagramLoginRequest) -> InstagramActionResponse:
+@router.post("/instagram/login", response_model=InstagramAuthResponse)
+async def instagram_login(request: Request, body: InstagramLoginRequest) -> InstagramAuthResponse:
     settings = _settings(request)
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
@@ -157,37 +163,61 @@ async def instagram_login(request: Request, body: InstagramLoginRequest) -> Inst
     if not username or not password:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Instagram credentials are not configured")
     try:
-        await instagram.login_future(
+        result = await instagram.login_future(
             username,
             password,
             {
                 "verificationCode": body.verificationCode.get_secret_value() if body.verificationCode else "",
             },
         )
+    except InstagramAuthFlowError as exc:
+        return _auth_flow_response(exc)
     except Exception as exc:
         raise _safe_instagram_exception(exc) from exc
-    return InstagramActionResponse(ok=True, action="login")
+    return InstagramAuthResponse(**result.to_response())
 
 
-@router.post("/instagram/challenge/resolve", response_model=InstagramActionResponse)
-async def instagram_challenge_resolve(
-    request: Request,
-    body: InstagramChallengeResolveRequest,
-) -> InstagramActionResponse:
+async def _resolve_verification(request: Request, body: InstagramChallengeResolveRequest) -> InstagramAuthResponse:
     settings = _settings(request)
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
     username = body.username or settings.instagram_username or None
     password = body.password.get_secret_value() if body.password else settings.instagram_password or None
     try:
-        await instagram.resolve_challenge_future(
+        result = await instagram.resolve_challenge_future(
             body.code.get_secret_value(),
             username=username,
             password=password,
         )
+    except InstagramAuthFlowError as exc:
+        return _auth_flow_response(exc)
     except Exception as exc:
         raise _safe_instagram_exception(exc) from exc
-    return InstagramActionResponse(ok=True, action="challenge-resolve")
+    return InstagramAuthResponse(**result.to_response())
+
+
+@router.post("/instagram/challenge/resolve", response_model=InstagramAuthResponse)
+async def instagram_challenge_resolve(
+    request: Request,
+    body: InstagramChallengeResolveRequest,
+) -> InstagramAuthResponse:
+    return await _resolve_verification(request, body)
+
+
+@router.post("/instagram/verification/two-factor", response_model=InstagramAuthResponse)
+async def instagram_two_factor_verification(
+    request: Request,
+    body: InstagramChallengeResolveRequest,
+) -> InstagramAuthResponse:
+    return await _resolve_verification(request, body)
+
+
+@router.post("/instagram/verification/challenge", response_model=InstagramAuthResponse)
+async def instagram_challenge_verification(
+    request: Request,
+    body: InstagramChallengeResolveRequest,
+) -> InstagramAuthResponse:
+    return await _resolve_verification(request, body)
 
 
 @router.post("/instagram/session/validate", response_model=InstagramSessionValidateResponse)

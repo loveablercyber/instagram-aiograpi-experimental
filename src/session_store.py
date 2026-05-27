@@ -7,14 +7,19 @@ from src.config import Settings
 from src.security.encryption import EncryptionService
 
 try:
-    from pymongo import ASCENDING, AsyncMongoClient
+    from pymongo import ASCENDING, AsyncMongoClient, ReturnDocument
 except Exception:  # pragma: no cover - dependency is required in runtime image.
     ASCENDING = 1
     AsyncMongoClient = None
+    ReturnDocument = None
 
 
 class SessionStoreError(RuntimeError):
     """Raised when session persistence cannot complete safely."""
+
+
+def _verification_context_key(account_key: str) -> str:
+    return f"{account_key}:verification"
 
 
 class MongoSessionStore:
@@ -60,6 +65,7 @@ class MongoSessionStore:
     async def ensure_indexes(self) -> None:
         collection = self.session_collection()
         await collection.create_index([("accountKey", ASCENDING)], unique=True, name="unique_account_key")
+        await collection.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0, name="verification_expires_at")
         await self.audit_collection().create_index([("createdAt", ASCENDING)], name="audit_created_at")
         await self.message_collection().create_index(
             [("accountKey", ASCENDING), ("messageId", ASCENDING)],
@@ -109,6 +115,68 @@ class MongoSessionStore:
 
     async def delete_session(self, account_key: str) -> bool:
         result = await self.session_collection().delete_one({"accountKey": account_key})
+        return result.deleted_count > 0
+
+    async def save_verification_context(
+        self,
+        account_key: str,
+        context_payload: dict[str, Any],
+        *,
+        challenge_type: str,
+        expires_at: datetime,
+    ) -> None:
+        encrypted = self.encryption.encrypt_json(context_payload)
+        now = datetime.now(UTC)
+        await self.session_collection().update_one(
+            {"accountKey": _verification_context_key(account_key)},
+            {
+                "$set": {
+                    "accountKey": _verification_context_key(account_key),
+                    "encryptedSettings": encrypted,
+                    "encryptionVersion": "v1",
+                    "library": "aiograpi",
+                    "libraryVersion": "1.0.9",
+                    "status": "pending_verification",
+                    "challengeType": challenge_type,
+                    "attempts": 0,
+                    "updatedAt": now,
+                    "expiresAt": expires_at,
+                    "lastValidationAt": None,
+                    "lastChallengeType": challenge_type,
+                    "lastErrorCode": None,
+                },
+                "$setOnInsert": {"createdAt": now},
+            },
+            upsert=True,
+        )
+
+    async def restore_verification_context(self, account_key: str) -> dict[str, Any] | None:
+        document = await self.session_collection().find_one({"accountKey": _verification_context_key(account_key)})
+        if not document:
+            return None
+        expires_at = document.get("expiresAt")
+        if isinstance(expires_at, datetime) and expires_at.replace(tzinfo=UTC) <= datetime.now(UTC):
+            await self.delete_verification_context(account_key)
+            return None
+        encrypted = document.get("encryptedSettings")
+        if not encrypted:
+            return None
+        payload = self.encryption.decrypt_json(encrypted)
+        payload["challengeType"] = document.get("challengeType")
+        return payload
+
+    async def record_verification_attempt(self, account_key: str, *, max_attempts: int = 2) -> int:
+        document = await self.session_collection().find_one_and_update(
+            {"accountKey": _verification_context_key(account_key), "attempts": {"$lt": max_attempts}},
+            {"$inc": {"attempts": 1}, "$set": {"updatedAt": datetime.now(UTC)}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not document:
+            raise SessionStoreError("Verification attempt limit exceeded or context unavailable")
+        return int(document.get("attempts", 0))
+
+    async def delete_verification_context(self, account_key: str) -> bool:
+        result = await self.session_collection().delete_one({"accountKey": _verification_context_key(account_key)})
         return result.deleted_count > 0
 
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:
@@ -172,6 +240,58 @@ class MemorySessionStore:
 
     async def delete_session(self, account_key: str) -> bool:
         return self.documents.pop(account_key, None) is not None
+
+    async def save_verification_context(
+        self,
+        account_key: str,
+        context_payload: dict[str, Any],
+        *,
+        challenge_type: str,
+        expires_at: datetime,
+    ) -> None:
+        encrypted = self.encryption.encrypt_json(context_payload)
+        now = datetime.now(UTC)
+        existing = self.documents.get(_verification_context_key(account_key), {})
+        self.documents[_verification_context_key(account_key)] = {
+            "accountKey": _verification_context_key(account_key),
+            "encryptedSettings": encrypted,
+            "encryptionVersion": "v1",
+            "library": "aiograpi",
+            "libraryVersion": "1.0.9",
+            "status": "pending_verification",
+            "challengeType": challenge_type,
+            "attempts": 0,
+            "createdAt": existing.get("createdAt", now),
+            "updatedAt": now,
+            "expiresAt": expires_at,
+            "lastValidationAt": None,
+            "lastChallengeType": challenge_type,
+            "lastErrorCode": None,
+        }
+
+    async def restore_verification_context(self, account_key: str) -> dict[str, Any] | None:
+        document = self.documents.get(_verification_context_key(account_key))
+        if not document:
+            return None
+        expires_at = document.get("expiresAt")
+        if isinstance(expires_at, datetime) and expires_at <= datetime.now(UTC):
+            await self.delete_verification_context(account_key)
+            return None
+        payload = self.encryption.decrypt_json(document["encryptedSettings"])
+        payload["challengeType"] = document.get("challengeType")
+        return payload
+
+    async def record_verification_attempt(self, account_key: str, *, max_attempts: int = 2) -> int:
+        key = _verification_context_key(account_key)
+        document = self.documents.get(key)
+        if not document or document.get("attempts", 0) >= max_attempts:
+            raise SessionStoreError("Verification attempt limit exceeded or context unavailable")
+        document["attempts"] = int(document.get("attempts", 0)) + 1
+        document["updatedAt"] = datetime.now(UTC)
+        return document["attempts"]
+
+    async def delete_verification_context(self, account_key: str) -> bool:
+        return self.documents.pop(_verification_context_key(account_key), None) is not None
 
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:
         return self.documents.get(account_key)

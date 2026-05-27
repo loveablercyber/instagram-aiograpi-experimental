@@ -54,6 +54,15 @@ class InstagramActionResponse(BaseModel):
     challengeType: str | None = None
 
 
+class InstagramAuthResponse(BaseModel):
+    status: str
+    nextAction: str
+    sessionStored: bool | None = None
+    verificationType: str | None = None
+    challengeMethod: str | None = None
+    reason: str | None = None
+
+
 class InstagramSessionValidateResponse(BaseModel):
     ok: bool
     authenticated: bool

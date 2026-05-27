@@ -11,8 +11,10 @@ from aiograpi.exceptions import (
     BadCredentials,
     BadPassword,
     CaptchaChallengeRequired,
+    ChallengeRedirection,
     ChallengeRequired,
     ChallengeSelfieCaptcha,
+    ChallengeUnknownStep,
     CheckpointRequired,
     ClientError,
     ClientLoginRequired,
@@ -20,15 +22,20 @@ from aiograpi.exceptions import (
     ConsentRequired,
     FeedbackRequired,
     GeoBlockRequired,
+    LegacyForceSetNewPasswordForm,
     LoginRequired,
     PleaseWaitFewMinutes,
+    RecaptchaChallengeForm,
+    SelectContactPointRecoveryForm,
     SentryBlock,
+    SubmitPhoneNumberForm,
     TwoFactorRequired,
+    UnknownError,
 )
 
 from src.config import Settings
 from src.services.audit import AuditService
-from src.session_store import MemorySessionStore, MongoSessionStore
+from src.session_store import MemorySessionStore, MongoSessionStore, SessionStoreError
 
 
 class RealConnectionDisabledError(RuntimeError):
@@ -37,6 +44,39 @@ class RealConnectionDisabledError(RuntimeError):
 
 class InstagramAuthError(RuntimeError):
     """Raised for authentication failures without exposing provider details."""
+
+
+@dataclass(frozen=True)
+class InstagramAuthResult:
+    status: str
+    session_stored: bool = False
+    verification_type: str | None = None
+    challenge_method: str | None = None
+    reason: str | None = None
+    next_action: str = "do_not_retry_automatically"
+
+    def to_response(self) -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "status": self.status,
+            "nextAction": self.next_action,
+        }
+        if self.session_stored:
+            response["sessionStored"] = True
+        if self.verification_type:
+            response["verificationType"] = self.verification_type
+        if self.challenge_method:
+            response["challengeMethod"] = self.challenge_method
+        if self.reason:
+            response["reason"] = self.reason
+        return response
+
+
+class InstagramAuthFlowError(RuntimeError):
+    """Raised when login completes with a safe, actionable non-success status."""
+
+    def __init__(self, result: InstagramAuthResult):
+        super().__init__(result.status)
+        self.result = result
 
 
 class InstagramChallengeRequiredError(RuntimeError):
@@ -80,9 +120,7 @@ class _SilentLogger:
 
 
 @dataclass
-class PendingLogin:
-    username: str
-    password: str
+class PendingVerificationContext:
     settings_payload: dict[str, Any]
     challenge_type: str
     created_at: datetime
@@ -101,7 +139,7 @@ class InstagramClientService:
         self.audit = audit
         self._client_factory = client_factory
         self._client: Any | None = None
-        self._pending_login: PendingLogin | None = None
+        self._pending_context: PendingVerificationContext | None = None
 
     async def load_session_from_store(self, account_key: str) -> dict[str, Any] | None:
         return await self.session_store.restore_settings(account_key)
@@ -119,7 +157,7 @@ class InstagramClientService:
                 account_key=self.settings.instagram_test_account_key,
                 metadata={"operation": operation},
             )
-            raise RealConnectionDisabledError("Real Instagram connection is disabled for Phase 1")
+            raise RealConnectionDisabledError("Real Instagram connection is disabled")
 
     def _new_client(self, settings_payload: dict[str, Any] | None = None, challenge_code: str | None = None) -> Any:
         client = self._client_factory(
@@ -140,33 +178,164 @@ class InstagramClientService:
         with redirect_stdout(stdout), redirect_stderr(stderr):
             return await awaitable
 
-    def _pending_login_valid(self) -> bool:
-        if self._pending_login is None:
+    def _pending_context_valid(self) -> bool:
+        if self._pending_context is None:
             return False
-        return datetime.now(UTC) - self._pending_login.created_at < timedelta(minutes=10)
+        return datetime.now(UTC) - self._pending_context.created_at < timedelta(minutes=10)
 
-    def _set_pending_login(self, username: str, password: str, client: Any, challenge_type: str) -> None:
-        self._pending_login = PendingLogin(
-            username=username,
-            password=password,
+    async def _set_pending_context(self, client: Any, challenge_type: str) -> None:
+        context = {
+            "settingsPayload": client.get_settings(),
+            "createdAt": datetime.now(UTC).isoformat(),
+        }
+        expires_at = datetime.now(UTC) + timedelta(minutes=10)
+        try:
+            await self.session_store.save_verification_context(
+                self.settings.instagram_test_account_key,
+                context,
+                challenge_type=challenge_type,
+                expires_at=expires_at,
+            )
+            await self.audit.record("CHALLENGE_CONTEXT_STORED", account_key=self.settings.instagram_test_account_key)
+        except Exception:
+            await self.audit.record(
+                "CHALLENGE_CONTEXT_NOT_PERSISTABLE",
+                account_key=self.settings.instagram_test_account_key,
+            )
+        self._pending_context = PendingVerificationContext(
             settings_payload=client.get_settings(),
             challenge_type=challenge_type,
             created_at=datetime.now(UTC),
         )
 
-    def _clear_pending_login(self) -> None:
-        self._pending_login = None
+    async def _load_pending_context(self) -> dict[str, Any] | None:
+        context = await self.session_store.restore_verification_context(self.settings.instagram_test_account_key)
+        if context:
+            return context
+        if self._pending_context_valid() and self._pending_context is not None:
+            return {
+                "settingsPayload": self._pending_context.settings_payload,
+                "challengeType": self._pending_context.challenge_type,
+            }
+        return None
+
+    async def _clear_pending_context(self) -> None:
+        self._pending_context = None
+        try:
+            await self.session_store.delete_verification_context(self.settings.instagram_test_account_key)
+        except Exception:
+            return None
 
     def _classify_challenge(self, exc: Exception) -> str:
         if isinstance(exc, TwoFactorRequired):
-            return "two_factor_required"
+            return "two_factor"
         if isinstance(exc, CaptchaChallengeRequired):
-            return "captcha_required"
+            return "captcha"
         if isinstance(exc, ChallengeSelfieCaptcha):
-            return "selfie_captcha_required"
+            return "selfie_captcha"
         if isinstance(exc, CheckpointRequired):
-            return "checkpoint_required"
-        return "challenge_required"
+            return "checkpoint"
+        if isinstance(exc, SelectContactPointRecoveryForm):
+            return "select_contact_point"
+        if isinstance(exc, SubmitPhoneNumberForm):
+            return "submit_phone_number"
+        if isinstance(exc, RecaptchaChallengeForm):
+            return "recaptcha"
+        if isinstance(exc, ChallengeUnknownStep):
+            return "unknown_step"
+        return "challenge"
+
+    def _result_for_exception(self, exc: Exception) -> tuple[InstagramAuthResult, str]:
+        if isinstance(exc, TwoFactorRequired):
+            return (
+                InstagramAuthResult(
+                    status="verification_required",
+                    verification_type="two_factor",
+                    next_action="submit_verification_code",
+                ),
+                "LOGIN_TWO_FACTOR_REQUIRED",
+            )
+        if isinstance(exc, (ChallengeRequired, ChallengeRedirection, SelectContactPointRecoveryForm)):
+            return (
+                InstagramAuthResult(
+                    status="verification_required",
+                    verification_type="challenge",
+                    challenge_method="email_or_sms_or_unknown",
+                    next_action="submit_verification_code",
+                ),
+                "LOGIN_CHALLENGE_REQUIRED",
+            )
+        if isinstance(exc, (RecaptchaChallengeForm, SubmitPhoneNumberForm, ChallengeUnknownStep)):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="challenge_requires_manual_account_action",
+                    next_action="check_instagram_app_or_email",
+                ),
+                "LOGIN_CHALLENGE_REQUIRED",
+            )
+        if isinstance(exc, (CheckpointRequired, ChallengeSelfieCaptcha, CaptchaChallengeRequired)):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="checkpoint_or_login_confirmation",
+                    next_action="check_instagram_app_or_email",
+                ),
+                "LOGIN_CHECKPOINT_REQUIRED",
+            )
+        if isinstance(exc, LegacyForceSetNewPasswordForm):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="password_reset_required",
+                    next_action="check_instagram_app_or_email",
+                ),
+                "LOGIN_CHECKPOINT_REQUIRED",
+            )
+        if isinstance(exc, (BadPassword, BadCredentials)):
+            return (
+                InstagramAuthResult(
+                    status="authentication_rejected",
+                    reason="credentials_or_login_context_rejected",
+                    next_action="do_not_retry_automatically",
+                ),
+                "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
+            )
+        if isinstance(exc, (FeedbackRequired, PleaseWaitFewMinutes, ClientThrottledError, SentryBlock)):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="feedback_required_or_rate_limited",
+                    next_action="do_not_retry_automatically",
+                ),
+                "LOGIN_FEEDBACK_REQUIRED",
+            )
+        if isinstance(exc, ConsentRequired):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="consent_required",
+                    next_action="check_instagram_app_or_email",
+                ),
+                "LOGIN_CONSENT_REQUIRED",
+            )
+        if isinstance(exc, GeoBlockRequired):
+            return (
+                InstagramAuthResult(
+                    status="manual_action_required",
+                    reason="geoblock_required",
+                    next_action="do_not_retry_automatically",
+                ),
+                "LOGIN_GEOBLOCK_REQUIRED",
+            )
+        return (
+            InstagramAuthResult(
+                status="authentication_failed_unclassified",
+                reason="sanitized_unclassified_instagram_response",
+                next_action="inspect_sanitized_server_log_before_retry",
+            ),
+            "LOGIN_UNCLASSIFIED_FAILURE",
+        )
 
     def _raise_safe_provider_error(self, exc: Exception) -> None:
         if isinstance(exc, (TwoFactorRequired, ChallengeRequired)):
@@ -181,7 +350,7 @@ class InstagramClientService:
             raise InstagramAuthError("Invalid Instagram credentials") from exc
         if isinstance(exc, (ClientLoginRequired, LoginRequired)):
             raise InstagramAuthError("Stored Instagram session is invalid") from exc
-        if isinstance(exc, ClientError):
+        if isinstance(exc, (ClientError, UnknownError)):
             raise InstagramOperationError("Instagram client operation failed") from exc
         raise InstagramOperationError("Instagram operation failed") from exc
 
@@ -202,62 +371,126 @@ class InstagramClientService:
             self._raise_safe_provider_error(exc)
         return False
 
-    async def login_future(self, username: str, password: str, challenge_data: dict[str, Any] | None = None) -> bool:
+    async def login_future(
+        self,
+        username: str,
+        password: str,
+        challenge_data: dict[str, Any] | None = None,
+    ) -> InstagramAuthResult:
         await self._block_real_connection("login")
         if not username or not password:
             raise InstagramAuthError("Instagram username and password are required")
         challenge_data = challenge_data or {}
         verification_code = challenge_data.get("verificationCode") or challenge_data.get("code") or ""
         settings_payload = challenge_data.get("settingsPayload")
+        is_verification_attempt = bool(challenge_data.get("isVerificationAttempt"))
         client = self._new_client(settings_payload=settings_payload, challenge_code=verification_code)
+        await self.audit.record("LOGIN_ATTEMPT_STARTED", account_key=self.settings.instagram_test_account_key)
         try:
             logged_in = await self._run_silently(
                 client.login(username=username, password=password, verification_code=verification_code)
             )
-        except (TwoFactorRequired, ChallengeRequired) as exc:
-            challenge_type = self._classify_challenge(exc)
-            self._set_pending_login(username, password, client, challenge_type)
-            await self.audit.record(
-                "INSTAGRAM_LOGIN_CHALLENGE_REQUIRED",
-                account_key=self.settings.instagram_test_account_key,
-                metadata={"challengeType": challenge_type},
-            )
-            raise InstagramChallengeRequiredError(challenge_type) from exc
         except Exception as exc:
-            self._clear_pending_login()
-            await self.audit.record("INSTAGRAM_LOGIN_FAILED", account_key=self.settings.instagram_test_account_key)
-            self._raise_safe_provider_error(exc)
+            result, audit_event = self._result_for_exception(exc)
+            if is_verification_attempt:
+                await self.audit.record("VERIFICATION_FAILED", account_key=self.settings.instagram_test_account_key)
+                raise InstagramAuthFlowError(
+                    InstagramAuthResult(
+                        status="verification_failed",
+                        reason=result.reason or result.verification_type or "verification_not_accepted",
+                        next_action="do_not_retry_automatically",
+                    )
+                ) from exc
+            challenge_type = self._classify_challenge(exc)
+            if result.status == "verification_required":
+                await self._set_pending_context(client, challenge_type)
+            await self.audit.record(
+                audit_event,
+                account_key=self.settings.instagram_test_account_key,
+                metadata={"classification": result.status, "challengeType": challenge_type},
+            )
+            raise InstagramAuthFlowError(result) from exc
         if not logged_in:
-            await self.audit.record("INSTAGRAM_LOGIN_FAILED", account_key=self.settings.instagram_test_account_key)
-            raise InstagramAuthError("Instagram login was not accepted")
+            await self.audit.record(
+                "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
+                account_key=self.settings.instagram_test_account_key,
+            )
+            raise InstagramAuthFlowError(
+                InstagramAuthResult(
+                    status="authentication_rejected",
+                    reason="credentials_or_login_context_rejected",
+                    next_action="do_not_retry_automatically",
+                )
+            )
         await self.save_session_to_store(self.settings.instagram_test_account_key, client.get_settings())
         self._client = client
-        self._clear_pending_login()
-        await self.audit.record("INSTAGRAM_LOGIN_SUCCEEDED", account_key=self.settings.instagram_test_account_key)
-        return True
+        await self._clear_pending_context()
+        await self.audit.record("LOGIN_SUCCEEDED", account_key=self.settings.instagram_test_account_key)
+        await self.audit.record("REAL_SESSION_ENCRYPTED_AND_STORED", account_key=self.settings.instagram_test_account_key)
+        if is_verification_attempt:
+            await self.audit.record("VERIFICATION_SUCCEEDED", account_key=self.settings.instagram_test_account_key)
+        return InstagramAuthResult(
+            status="authenticated",
+            session_stored=True,
+            next_action="validate_session",
+        )
 
     async def resolve_challenge_future(
         self,
         code: str,
         username: str | None = None,
         password: str | None = None,
-    ) -> bool:
+    ) -> InstagramAuthResult:
         await self._block_real_connection("challenge_resolve")
         if not code:
-            raise InstagramChallengeRequiredError("code_required")
-        if username and password:
-            return await self.login_future(username, password, {"verificationCode": code, "code": code})
-        if not self._pending_login_valid() or self._pending_login is None:
-            raise InstagramChallengeRequiredError("pending_login_not_available")
-        pending = self._pending_login
-        self._clear_pending_login()
+            raise InstagramAuthFlowError(
+                InstagramAuthResult(
+                    status="verification_required",
+                    verification_type="challenge",
+                    reason="code_required",
+                    next_action="submit_verification_code",
+                )
+            )
+        try:
+            await self.session_store.record_verification_attempt(
+                self.settings.instagram_test_account_key,
+                max_attempts=2,
+            )
+        except SessionStoreError as exc:
+            await self.audit.record("VERIFICATION_RATE_LIMITED", account_key=self.settings.instagram_test_account_key)
+            raise InstagramAuthFlowError(
+                InstagramAuthResult(
+                    status="verification_failed",
+                    reason="verification_attempt_limit_exceeded_or_context_missing",
+                    next_action="start_new_login_after_manual_approval",
+                )
+            ) from exc
+        await self.audit.record("VERIFICATION_CODE_SUBMITTED", account_key=self.settings.instagram_test_account_key)
+        context = await self._load_pending_context()
+        if not context:
+            raise InstagramAuthFlowError(
+                InstagramAuthResult(
+                    status="verification_failed",
+                    reason="challenge_context_missing_or_expired",
+                    next_action="start_new_login_after_manual_approval",
+                )
+            )
+        if not username or not password:
+            raise InstagramAuthFlowError(
+                InstagramAuthResult(
+                    status="verification_failed",
+                    reason="credentials_required_for_verification",
+                    next_action="start_new_login_after_manual_approval",
+                )
+            )
         return await self.login_future(
-            pending.username,
-            pending.password,
+            username,
+            password,
             {
                 "verificationCode": code,
                 "code": code,
-                "settingsPayload": pending.settings_payload,
+                "settingsPayload": context.get("settingsPayload"),
+                "isVerificationAttempt": True,
             },
         )
 
@@ -327,7 +560,7 @@ class InstagramClientService:
                 pass
         removed = await self.delete_session_from_store(account_key)
         self._client = None
-        self._clear_pending_login()
+        await self._clear_pending_context()
         await self.audit.record("INSTAGRAM_LOGOUT_COMPLETED", account_key=account_key)
         return removed
 
