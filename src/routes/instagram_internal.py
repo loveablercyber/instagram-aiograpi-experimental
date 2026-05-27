@@ -63,7 +63,11 @@ async def session_test_store(request: Request) -> SessionActionResponse:
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
     audit = request.app.state.audit
-    await instagram.save_session_to_store(settings.instagram_test_account_key, FAKE_SETTINGS)
+    try:
+        await instagram.save_session_to_store(settings.instagram_test_account_key, FAKE_SETTINGS)
+    except Exception as exc:
+        await audit.record("MONGODB_CONNECTION_FAILED", account_key=settings.instagram_test_account_key)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Session store unavailable") from exc
     await audit.record("SESSION_TEST_STORED", account_key=settings.instagram_test_account_key)
     return SessionActionResponse(ok=True, action="test-store", accountKey=settings.instagram_test_account_key)
 
@@ -74,7 +78,11 @@ async def session_test_restore(request: Request) -> SessionActionResponse:
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
     audit = request.app.state.audit
-    restored = await instagram.load_session_from_store(settings.instagram_test_account_key)
+    try:
+        restored = await instagram.load_session_from_store(settings.instagram_test_account_key)
+    except Exception as exc:
+        await audit.record("MONGODB_CONNECTION_FAILED", account_key=settings.instagram_test_account_key)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Session store unavailable") from exc
     if not restored:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No experimental session stored")
     if restored.get("cookies", {}).get("sessionid") != FAKE_SETTINGS["cookies"]["sessionid"]:
@@ -90,6 +98,10 @@ async def delete_session(request: Request, body: RemoveSessionRequest) -> Sessio
     settings = _settings(request)
     instagram = request.app.state.instagram
     audit = request.app.state.audit
-    removed = await instagram.delete_session_from_store(settings.instagram_test_account_key)
+    try:
+        removed = await instagram.delete_session_from_store(settings.instagram_test_account_key)
+    except Exception as exc:
+        await audit.record("MONGODB_CONNECTION_FAILED", account_key=settings.instagram_test_account_key)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Session store unavailable") from exc
     await audit.record("SESSION_REMOVED", account_key=settings.instagram_test_account_key)
     return SessionActionResponse(ok=removed, action="delete", accountKey=settings.instagram_test_account_key)
