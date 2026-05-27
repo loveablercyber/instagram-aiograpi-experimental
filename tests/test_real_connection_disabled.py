@@ -43,3 +43,31 @@ async def test_polling_does_not_start_when_flag_false(app_components):
     assert started is False
     assert polling.started is False
     assert any(event["event"] == "POLLING_BLOCKED" for event in audit.memory_events)
+
+
+def test_phase2_internal_routes_are_blocked_when_flag_false(client, auth_headers):
+    login = client.post(
+        "/internal/instagram/login",
+        headers=auth_headers,
+        json={"username": "test-user", "password": "test-password"},
+    )
+    validate = client.post("/internal/instagram/session/validate", headers=auth_headers)
+    threads = client.get("/internal/instagram/threads", headers=auth_headers)
+    messages = client.get("/internal/instagram/threads/123/messages", headers=auth_headers)
+    send = client.post(
+        "/internal/instagram/threads/123/send-text",
+        headers=auth_headers,
+        json={"text": "test only"},
+    )
+    logout = client.post(
+        "/internal/instagram/logout",
+        headers=auth_headers,
+        json={"confirm": "LOGOUT_INSTAGRAM_TEST_ACCOUNT"},
+    )
+
+    assert login.status_code == 403
+    assert validate.status_code == 403
+    assert threads.status_code == 403
+    assert messages.status_code == 403
+    assert send.status_code == 403
+    assert logout.status_code == 403

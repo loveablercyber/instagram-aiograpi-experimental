@@ -12,6 +12,7 @@ from src.routes.instagram_internal import router as internal_router
 from src.security.encryption import EncryptionService
 from src.services.audit import AuditService
 from src.services.polling import PollingService
+from src.services.rate_limit import RateLimitConfig, RateLimitService
 from src.session_store import MemorySessionStore, MongoSessionStore
 
 
@@ -55,6 +56,7 @@ def create_app(
     app.state.session_store = session_store
     app.state.audit = audit
     app.state.instagram = instagram
+    app.state.rate_limit = RateLimitService(RateLimitConfig(settings.instagram_max_sends_per_hour))
     app.include_router(health_router)
     app.include_router(internal_router)
     return app

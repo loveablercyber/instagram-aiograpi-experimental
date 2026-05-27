@@ -83,8 +83,8 @@ class Settings:
             instagram_password=os.getenv("INSTAGRAM_PASSWORD", ""),
             instagram_polling_enabled=_get_bool("INSTAGRAM_POLLING_ENABLED", False),
             instagram_polling_interval_seconds=_get_int("INSTAGRAM_POLLING_INTERVAL_SECONDS", 60),
-            instagram_max_messages_per_fetch=_get_int("INSTAGRAM_MAX_MESSAGES_PER_FETCH", 20),
-            instagram_max_sends_per_hour=_get_int("INSTAGRAM_MAX_SENDS_PER_HOUR", 5),
+            instagram_max_messages_per_fetch=_get_int("INSTAGRAM_MAX_MESSAGES_PER_FETCH", 10),
+            instagram_max_sends_per_hour=_get_int("INSTAGRAM_MAX_SENDS_PER_HOUR", 2),
             instagram_proxy_url=os.getenv("INSTAGRAM_PROXY_URL", ""),
         )
         settings.validate()

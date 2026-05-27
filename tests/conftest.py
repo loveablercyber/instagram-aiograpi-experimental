@@ -33,8 +33,8 @@ def make_settings(**overrides) -> Settings:
         "instagram_password": "",
         "instagram_polling_enabled": False,
         "instagram_polling_interval_seconds": 60,
-        "instagram_max_messages_per_fetch": 20,
-        "instagram_max_sends_per_hour": 5,
+        "instagram_max_messages_per_fetch": 10,
+        "instagram_max_sends_per_hour": 2,
         "instagram_proxy_url": "",
     }
     values.update(overrides)
@@ -43,12 +43,15 @@ def make_settings(**overrides) -> Settings:
     return settings
 
 
-def make_components(settings: Settings | None = None):
+def make_components(settings: Settings | None = None, client_factory=None):
     settings = settings or make_settings()
     encryption = EncryptionService(settings.session_encryption_key)
     store = MemorySessionStore(settings, encryption)
     audit = AuditService()
-    instagram = InstagramClientService(settings, store, audit)
+    if client_factory is None:
+        instagram = InstagramClientService(settings, store, audit)
+    else:
+        instagram = InstagramClientService(settings, store, audit, client_factory=client_factory)
     return settings, store, audit, instagram
 
 

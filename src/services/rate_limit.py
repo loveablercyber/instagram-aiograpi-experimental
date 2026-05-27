@@ -11,7 +11,7 @@ class RateLimitExceeded(RuntimeError):
 
 @dataclass(frozen=True)
 class RateLimitConfig:
-    max_sends_per_hour: int = 5
+    max_sends_per_hour: int = 2
 
 
 class RateLimitService:
