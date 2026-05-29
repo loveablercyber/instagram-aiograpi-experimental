@@ -56,6 +56,17 @@ Authorization: Bearer <INTERNAL_API_TOKEN>
 
 O diagnostico nunca deve conter senha, cookies completos, `sessionid`, `csrftoken`, header de autorizacao, codigo 2FA, settings em claro ou URI do MongoDB.
 
+Antes de interpretar `invalid_user` em uma tentativa privada, execute o preflight publico:
+
+```http
+GET /internal/instagram/account/preflight
+Authorization: Bearer <INTERNAL_API_TOKEN>
+```
+
+Esse endpoint nao usa senha, nao executa login, nao cria sessao e nao ativa polling. Ele tenta consultar a existencia publica do perfil configurado e retorna somente `username_redacted`, `public_profile_exists`, `profile_identifier_present`, `login_attempt_performed=false`, `checked_at` e `safe_interpretation`.
+
+Se o preflight publico indicar que o perfil existe, mas a autenticacao privada retornar `invalid_user`, a interpretacao correta e: o perfil publico existe, mas o Instagram rejeitou o contexto privado de login. Isso pode envolver IP, dispositivo, sessao, trust do fluxo privado ou politica antiabuso, e nao prova que a conta nao exista.
+
 Se a tentativa retornar `unknown_error`, `checkpoint_required`, `blocked`, `sentry_block`, `throttled` ou `please_wait`, interrompa o teste. A proxima tentativa exige nova autorizacao manual e novo corpo com `confirmManualAttempt`.
 
 Polling permanece separado da autenticacao. Ele so podera ser estudado depois que existir sessao persistida, restaurada e validada por `/internal/instagram/session/validate`.

@@ -209,6 +209,31 @@ class MongoSessionStore:
         diagnostic = document.get("diagnostic")
         return diagnostic if isinstance(diagnostic, dict) else None
 
+    async def save_account_preflight(self, account_key: str, preflight: dict[str, Any]) -> None:
+        await self.audit_collection().insert_one(
+            {
+                "event": "ACCOUNT_PREFLIGHT_CHECKED",
+                "accountKey": account_key,
+                "preflight": preflight,
+                "createdAt": datetime.now(UTC),
+            }
+        )
+
+    async def latest_account_preflight(self, account_key: str) -> dict[str, Any] | None:
+        document = await self.audit_collection().find_one(
+            {
+                "event": "ACCOUNT_PREFLIGHT_CHECKED",
+                "accountKey": account_key,
+                "preflight": {"$exists": True},
+            },
+            sort=[("createdAt", -1)],
+            projection={"_id": 0},
+        )
+        if not document:
+            return None
+        preflight = document.get("preflight")
+        return preflight if isinstance(preflight, dict) else None
+
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:
         return await self.session_collection().find_one({"accountKey": account_key})
 
@@ -228,6 +253,7 @@ class MemorySessionStore:
         self.audit_documents: list[dict[str, Any]] = []
         self.message_documents: list[dict[str, Any]] = []
         self.auth_attempt_documents: list[dict[str, Any]] = []
+        self.account_preflight_documents: list[dict[str, Any]] = []
         self.connected = True
 
     async def ping(self) -> bool:
@@ -339,6 +365,23 @@ class MemorySessionStore:
             if document.get("accountKey") == account_key:
                 diagnostic = document.get("diagnostic")
                 return diagnostic if isinstance(diagnostic, dict) else None
+        return None
+
+    async def save_account_preflight(self, account_key: str, preflight: dict[str, Any]) -> None:
+        self.account_preflight_documents.append(
+            {
+                "event": "ACCOUNT_PREFLIGHT_CHECKED",
+                "accountKey": account_key,
+                "preflight": preflight,
+                "createdAt": datetime.now(UTC),
+            }
+        )
+
+    async def latest_account_preflight(self, account_key: str) -> dict[str, Any] | None:
+        for document in reversed(self.account_preflight_documents):
+            if document.get("accountKey") == account_key:
+                preflight = document.get("preflight")
+                return preflight if isinstance(preflight, dict) else None
         return None
 
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:

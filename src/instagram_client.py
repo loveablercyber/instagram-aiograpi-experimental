@@ -16,9 +16,11 @@ from aiograpi.exceptions import (
     ChallengeSelfieCaptcha,
     ChallengeUnknownStep,
     CheckpointRequired,
+    ClientBadRequestError,
     ClientConnectionError,
     ClientError,
     ClientForbiddenError,
+    ClientNotFoundError,
     ClientLoginRequired,
     ClientRequestTimeout,
     ClientThrottledError,
@@ -36,6 +38,7 @@ from aiograpi.exceptions import (
     SubmitPhoneNumberForm,
     TwoFactorRequired,
     UnknownError,
+    UserNotFound,
 )
 
 from src.auth_diagnostics import (
@@ -44,6 +47,7 @@ from src.auth_diagnostics import (
     diagnostic_success,
     new_attempt_id,
     redact_diagnostic,
+    redact_identifier,
     utc_now_iso,
 )
 from src.config import Settings
@@ -242,6 +246,75 @@ class InstagramClientService:
     async def latest_auth_attempt(self) -> dict[str, Any] | None:
         return await self.session_store.latest_auth_attempt(self.settings.instagram_test_account_key)
 
+    async def latest_account_preflight(self) -> dict[str, Any] | None:
+        return await self.session_store.latest_account_preflight(self.settings.instagram_test_account_key)
+
+    async def account_preflight_future(self, username: str) -> dict[str, Any]:
+        username = (username or "").strip()
+        redacted = redact_identifier(username)
+        checked_at = utc_now_iso()
+        if not username:
+            result = {
+                "username_redacted": "",
+                "public_profile_exists": None,
+                "profile_identifier_present": False,
+                "login_attempt_performed": False,
+                "checked_at": checked_at,
+                "safe_interpretation": "No profile identifier is configured for public preflight.",
+            }
+            await self.session_store.save_account_preflight(self.settings.instagram_test_account_key, result)
+            return result
+        client = self._new_client()
+        public_profile_exists: bool | None
+        safe_interpretation: str
+        try:
+            user = await self._run_silently(client.user_info_by_username_gql(username))
+            public_profile_exists = bool(_model_value(user, "pk", None) or _model_value(user, "id", None))
+            safe_interpretation = (
+                "Public profile exists. This does not validate private login; Instagram may still reject "
+                "the private authentication context, device, IP, session, or flow."
+            )
+        except (UserNotFound, ClientNotFoundError):
+            public_profile_exists = False
+            safe_interpretation = (
+                "Public profile was not found by the public preflight. Verify the identifier manually "
+                "before any new private login attempt."
+            )
+        except (ClientForbiddenError, ClientThrottledError, ClientBadRequestError, ClientConnectionError, ClientRequestTimeout):
+            public_profile_exists = None
+            safe_interpretation = (
+                "Public profile preflight was inconclusive because Instagram rejected or blocked the public check. "
+                "This is not proof that the profile does not exist."
+            )
+        except Exception:
+            public_profile_exists = None
+            safe_interpretation = (
+                "Public profile preflight was inconclusive. This is not proof that the profile does not exist."
+            )
+        result = {
+            "username_redacted": redacted,
+            "public_profile_exists": public_profile_exists,
+            "profile_identifier_present": True,
+            "login_attempt_performed": False,
+            "checked_at": checked_at,
+            "safe_interpretation": safe_interpretation,
+        }
+        await self.session_store.save_account_preflight(self.settings.instagram_test_account_key, result)
+        await self.audit.record(
+            "ACCOUNT_PREFLIGHT_CHECKED",
+            account_key=self.settings.instagram_test_account_key,
+            metadata={
+                "publicProfileExists": public_profile_exists,
+                "profileIdentifierPresent": True,
+                "loginAttemptPerformed": False,
+                "libraryName": "aiograpi",
+                "libraryVersion": "1.0.9",
+                "outboundNetworkIdentityConfigured": bool(self.settings.instagram_proxy_url),
+                "loginOrigin": "render",
+            },
+        )
+        return result
+
     async def _save_auth_diagnostic(self, diagnostic: InstagramAuthDiagnosticResult) -> None:
         await self.session_store.save_auth_attempt(
             self.settings.instagram_test_account_key,
@@ -258,6 +331,13 @@ class InstagramClientService:
                 "hasChallengeContext": diagnostic.has_challenge_context,
                 "hasTwoFactorIdentifier": diagnostic.has_two_factor_identifier,
                 "hasCheckpointUrl": diagnostic.has_checkpoint_url,
+                "libraryName": diagnostic.library_name,
+                "libraryVersion": diagnostic.library_version,
+                "appDeviceProfileConfigured": diagnostic.app_device_profile_configured,
+                "deviceSettingsPersisted": diagnostic.device_settings_persisted,
+                "outboundNetworkIdentityConfigured": diagnostic.outbound_network_identity_configured,
+                "storedSessionAvailable": diagnostic.stored_session_available,
+                "loginOrigin": diagnostic.login_origin,
             },
         )
 
@@ -388,7 +468,9 @@ class InstagramClientService:
         attempt_id: str,
         exc: Exception,
         client: Any,
+        stored_session_available: bool,
     ) -> tuple[InstagramAuthDiagnosticResult, str]:
+        operational_context = self._diagnostic_operational_context(client, stored_session_available)
         if isinstance(exc, TwoFactorRequired):
             return (
                 diagnostic_from_exception(
@@ -400,6 +482,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_TWO_FACTOR_REQUIRED",
             )
@@ -414,6 +497,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_CHALLENGE_REQUIRED",
             )
@@ -439,6 +523,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_CHECKPOINT_REQUIRED",
             )
@@ -447,12 +532,13 @@ class InstagramClientService:
                 diagnostic_from_exception(
                     attempt_id=attempt_id,
                     status="invalid_credentials",
-                    safe_message="Instagram rejected the credentials or login context.",
+                    safe_message="Instagram rejected the credentials or private login context.",
                     exc=exc,
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
             )
@@ -480,6 +566,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_FEEDBACK_REQUIRED",
             )
@@ -494,6 +581,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_CONSENT_REQUIRED",
             )
@@ -508,6 +596,7 @@ class InstagramClientService:
                     requires_manual_action=True,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_GEOBLOCK_REQUIRED",
             )
@@ -522,6 +611,7 @@ class InstagramClientService:
                     requires_manual_action=False,
                     retry_allowed=False,
                     sensitive_values=(self.settings.instagram_username,),
+                    **operational_context,
                 ),
                 "LOGIN_UNCLASSIFIED_FAILURE",
             )
@@ -538,9 +628,28 @@ class InstagramClientService:
                 requires_manual_action=True,
                 retry_allowed=False,
                 sensitive_values=(self.settings.instagram_username,),
+                **operational_context,
             ),
             "LOGIN_UNCLASSIFIED_FAILURE",
         )
+
+    def _diagnostic_operational_context(self, client: Any, stored_session_available: bool) -> dict[str, Any]:
+        settings_payload: dict[str, Any] = {}
+        if hasattr(client, "get_settings"):
+            try:
+                maybe_settings = client.get_settings()
+                if isinstance(maybe_settings, dict):
+                    settings_payload = maybe_settings
+            except Exception:
+                settings_payload = {}
+        device_settings = settings_payload.get("device_settings")
+        return {
+            "app_device_profile_configured": bool(isinstance(device_settings, dict) and device_settings),
+            "device_settings_persisted": stored_session_available,
+            "outbound_network_identity_configured": bool(self.settings.instagram_proxy_url),
+            "stored_session_available": stored_session_available,
+            "login_origin": "render",
+        }
 
     def _raise_safe_provider_error(self, exc: Exception) -> None:
         if isinstance(exc, (TwoFactorRequired, ChallengeRequired)):
@@ -659,6 +768,7 @@ class InstagramClientService:
         verification_code = challenge_data.get("verificationCode") or challenge_data.get("code") or ""
         settings_payload = challenge_data.get("settingsPayload")
         attempt_id = new_attempt_id()
+        stored_session_available = await self.session_store.session_exists(self.settings.instagram_test_account_key)
         client = self._new_client(settings_payload=settings_payload, challenge_code=verification_code)
         await self.audit.record(
             "LOGIN_ATTEMPT_STARTED",
@@ -670,7 +780,12 @@ class InstagramClientService:
                 client.login(username=username, password=password, verification_code=verification_code)
             )
         except Exception as exc:
-            diagnostic, audit_event = self._diagnostic_for_exception(attempt_id=attempt_id, exc=exc, client=client)
+            diagnostic, audit_event = self._diagnostic_for_exception(
+                attempt_id=attempt_id,
+                exc=exc,
+                client=client,
+                stored_session_available=stored_session_available,
+            )
             challenge_type = self._classify_challenge(exc)
             if diagnostic.status in {"challenge_required", "two_factor_required"}:
                 await self._set_pending_context(client, challenge_type)
@@ -685,6 +800,13 @@ class InstagramClientService:
                     "hasChallengeContext": diagnostic.has_challenge_context,
                     "hasTwoFactorIdentifier": diagnostic.has_two_factor_identifier,
                     "hasCheckpointUrl": diagnostic.has_checkpoint_url,
+                    "libraryName": diagnostic.library_name,
+                    "libraryVersion": diagnostic.library_version,
+                    "appDeviceProfileConfigured": diagnostic.app_device_profile_configured,
+                    "deviceSettingsPersisted": diagnostic.device_settings_persisted,
+                    "outboundNetworkIdentityConfigured": diagnostic.outbound_network_identity_configured,
+                    "storedSessionAvailable": diagnostic.stored_session_available,
+                    "loginOrigin": diagnostic.login_origin,
                 },
             )
             await self._save_auth_diagnostic(diagnostic)
@@ -707,6 +829,7 @@ class InstagramClientService:
                 requires_manual_action=True,
                 retry_allowed=False,
                 raw_response_sanitized={},
+                **self._diagnostic_operational_context(client, stored_session_available),
             )
             await self.audit.record(
                 "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
@@ -721,6 +844,14 @@ class InstagramClientService:
         diagnostic = redact_diagnostic(
             diagnostic_success(attempt_id=attempt_id, client=client),
             sensitive_values=(self.settings.instagram_username,),
+        )
+        diagnostic = InstagramAuthDiagnosticResult(
+            **{
+                **diagnostic.to_public_dict(),
+                **self._diagnostic_operational_context(client, True),
+                "device_settings_persisted": True,
+                "stored_session_available": True,
+            }
         )
         await self.audit.record(
             "LOGIN_SUCCEEDED",

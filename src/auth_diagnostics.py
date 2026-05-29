@@ -82,6 +82,11 @@ class InstagramAuthDiagnosticResult:
     raw_response_sanitized: dict[str, Any]
     library_name: str = LIBRARY_NAME
     library_version: str = LIBRARY_VERSION
+    app_device_profile_configured: bool = False
+    device_settings_persisted: bool = False
+    outbound_network_identity_configured: bool = False
+    stored_session_available: bool = False
+    login_origin: str = "render"
 
     @classmethod
     def blocked(cls, reason: str) -> "InstagramAuthDiagnosticResult":
@@ -156,6 +161,15 @@ def sanitize_instagram_auth_payload(
     return str(type(payload).__name__)
 
 
+def redact_identifier(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}***{value[-2:]}"
+
+
 def build_exception_payload(exc: Exception, client: Any | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if client is not None:
@@ -185,6 +199,11 @@ def diagnostic_from_exception(
     requires_manual_action: bool,
     retry_allowed: bool,
     sensitive_values: tuple[str, ...] = (),
+    app_device_profile_configured: bool = False,
+    device_settings_persisted: bool = False,
+    outbound_network_identity_configured: bool = False,
+    stored_session_available: bool = False,
+    login_origin: str = "render",
 ) -> InstagramAuthDiagnosticResult:
     payload = build_exception_payload(exc, client)
     sanitized = sanitize_instagram_auth_payload(_important_payload(payload), sensitive_values=sensitive_values)
@@ -209,10 +228,24 @@ def diagnostic_from_exception(
         requires_manual_action=requires_manual_action,
         retry_allowed=retry_allowed,
         raw_response_sanitized=sanitized,
+        app_device_profile_configured=app_device_profile_configured,
+        device_settings_persisted=device_settings_persisted,
+        outbound_network_identity_configured=outbound_network_identity_configured,
+        stored_session_available=stored_session_available,
+        login_origin=login_origin,
     )
 
 
-def diagnostic_success(*, attempt_id: str, client: Any) -> InstagramAuthDiagnosticResult:
+def diagnostic_success(
+    *,
+    attempt_id: str,
+    client: Any,
+    app_device_profile_configured: bool = False,
+    device_settings_persisted: bool = False,
+    outbound_network_identity_configured: bool = False,
+    stored_session_available: bool = False,
+    login_origin: str = "render",
+) -> InstagramAuthDiagnosticResult:
     settings_payload = _safe_get_settings(client)
     return InstagramAuthDiagnosticResult(
         attempt_id=attempt_id,
@@ -231,6 +264,11 @@ def diagnostic_success(*, attempt_id: str, client: Any) -> InstagramAuthDiagnost
         requires_manual_action=False,
         retry_allowed=False,
         raw_response_sanitized={},
+        app_device_profile_configured=app_device_profile_configured,
+        device_settings_persisted=device_settings_persisted,
+        outbound_network_identity_configured=outbound_network_identity_configured,
+        stored_session_available=stored_session_available,
+        login_origin=login_origin,
     )
 
 

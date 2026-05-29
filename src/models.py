@@ -83,11 +83,27 @@ class InstagramAuthDiagnosticResponse(BaseModel):
     raw_response_sanitized: dict
     library_name: str
     library_version: str
+    app_device_profile_configured: bool = False
+    device_settings_persisted: bool = False
+    outbound_network_identity_configured: bool = False
+    stored_session_available: bool = False
+    login_origin: str = "render"
+
+
+class InstagramAccountPreflightResponse(BaseModel):
+    username_redacted: str
+    public_profile_exists: bool | None
+    profile_identifier_present: bool
+    login_attempt_performed: bool
+    checked_at: str
+    safe_interpretation: str
 
 
 class InstagramAuthAttemptLatestResponse(BaseModel):
     found: bool
     diagnostic: InstagramAuthDiagnosticResponse | None = None
+    preflight: InstagramAccountPreflightResponse | None = None
+    correlation: dict | None = None
     recommendation: str
 
 

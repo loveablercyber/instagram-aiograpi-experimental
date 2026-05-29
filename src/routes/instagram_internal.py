@@ -18,6 +18,7 @@ from src.instagram_client import (
 )
 from src.models import (
     InstagramActionResponse,
+    InstagramAccountPreflightResponse,
     InstagramAuthAttemptLatestResponse,
     InstagramAuthDiagnosticResponse,
     InstagramAuthResponse,
@@ -198,6 +199,15 @@ async def instagram_login(request: Request, body: InstagramLoginRequest):
     return _auth_diagnostic_response(diagnostic)
 
 
+@router.get("/instagram/account/preflight", response_model=InstagramAccountPreflightResponse)
+async def instagram_account_preflight(request: Request) -> InstagramAccountPreflightResponse:
+    settings = _settings(request)
+    _ensure_test_phase(settings)
+    instagram = request.app.state.instagram
+    preflight = await instagram.account_preflight_future(settings.instagram_username)
+    return InstagramAccountPreflightResponse(**preflight)
+
+
 @router.get("/instagram/auth-attempts/latest", response_model=InstagramAuthAttemptLatestResponse)
 async def instagram_latest_auth_attempt(request: Request) -> InstagramAuthAttemptLatestResponse:
     instagram = request.app.state.instagram
@@ -210,6 +220,7 @@ async def instagram_latest_auth_attempt(request: Request) -> InstagramAuthAttemp
         )
     settings = _settings(request)
     latest = sanitize_diagnostic_dict(latest, sensitive_values=(settings.instagram_username,))
+    preflight = await instagram.latest_account_preflight()
     recommendation = "Review the sanitized diagnostic before any new manual attempt."
     if latest.get("status") == "success":
         recommendation = "Validate the restored session before using Direct endpoints."
@@ -217,7 +228,42 @@ async def instagram_latest_auth_attempt(request: Request) -> InstagramAuthAttemp
         recommendation = "Submit the verification code only through the protected verification endpoint."
     elif latest.get("status") in {"unknown_error", "checkpoint_required", "blocked"}:
         recommendation = "Do not retry automatically; inspect the Instagram app, e-mail, account state, and network context first."
-    return InstagramAuthAttemptLatestResponse(found=True, diagnostic=latest, recommendation=recommendation)
+    correlation = _auth_preflight_correlation(latest, preflight)
+    return InstagramAuthAttemptLatestResponse(
+        found=True,
+        diagnostic=latest,
+        preflight=preflight,
+        correlation=correlation,
+        recommendation=recommendation,
+    )
+
+
+def _auth_preflight_correlation(latest: dict[str, Any], preflight: dict[str, Any] | None) -> dict[str, Any]:
+    public_exists = preflight.get("public_profile_exists") if preflight else None
+    private_status = latest.get("status")
+    private_error_type = latest.get("response_error_type")
+    if public_exists is True and private_error_type == "invalid_user":
+        interpretation = (
+            "Public profile exists, but Instagram rejected the private login context. "
+            "Investigate network/device/session trust before any new login attempt."
+        )
+    elif private_error_type == "invalid_user":
+        interpretation = (
+            "Instagram rejected the identifier during private login. This does not prove the account does not exist; "
+            "it can indicate rejection of the authentication context, device, IP, session, or private flow."
+        )
+    elif public_exists is False:
+        interpretation = "Public preflight did not find the profile; verify the account identifier manually before private login."
+    elif public_exists is None:
+        interpretation = "Public preflight is absent or inconclusive; do not use private login errors alone as existence proof."
+    else:
+        interpretation = "Review public preflight and private login diagnostics together before any new manual attempt."
+    return {
+        "public_profile_exists": public_exists,
+        "private_login_status": private_status,
+        "private_login_error_type": private_error_type,
+        "safe_interpretation": interpretation,
+    }
 
 
 async def _resolve_verification(request: Request, body: InstagramChallengeResolveRequest) -> InstagramAuthResponse:

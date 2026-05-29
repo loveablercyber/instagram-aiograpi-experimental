@@ -21,6 +21,7 @@ Esta fase nao deve executar login automaticamente, nao envia mensagens e nao ini
 - `POST /internal/session/test-restore`: protegido, valida restauracao sem retornar payload.
 - `DELETE /internal/session`: protegido, remove a sessao experimental ficticia quando o body confirma `REMOVE_EXPERIMENTAL_SESSION`.
 - `POST /internal/instagram/login`: protegido, exige `confirmManualAttempt=RUN_ONE_MANUAL_LOGIN_ATTEMPT`, polling desligado e conexao real habilitada.
+- `GET /internal/instagram/account/preflight`: protegido, verifica o perfil publico configurado sem senha, sem login e sem sessao.
 - `GET /internal/instagram/auth-attempts/latest`: protegido, retorna o ultimo diagnostico de autenticacao sanitizado.
 
 Endpoints de threads, mensagens, envio e logout real permanecem protegidos e dependem de sessao real validada. Nao habilitar polling nem tentar Direct enquanto a autenticacao inicial nao estiver classificada e validada.
