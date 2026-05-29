@@ -4,6 +4,10 @@ import pytest
 
 from src.instagram_client import RealConnectionDisabledError
 from src.services.polling import PollingService
+from src.security.encryption import EncryptionService
+from src.session_store import MemorySessionStore
+from src.services.audit import AuditService
+from conftest import make_settings
 
 
 @pytest.mark.asyncio
@@ -43,6 +47,21 @@ async def test_polling_does_not_start_when_flag_false(app_components):
     assert started is False
     assert polling.started is False
     assert any(event["event"] == "POLLING_BLOCKED" for event in audit.memory_events)
+
+
+@pytest.mark.asyncio
+async def test_polling_does_not_start_without_valid_session():
+    settings = make_settings(instagram_real_connection_enabled=True, instagram_polling_enabled=True)
+    store = MemorySessionStore(settings, EncryptionService(settings.session_encryption_key))
+    audit = AuditService()
+    polling = PollingService(settings, audit, session_store=store)
+
+    started = await polling.start()
+
+    assert started is False
+    assert polling.started is False
+    event = next(event for event in audit.memory_events if event["event"] == "POLLING_BLOCKED")
+    assert event["metadata"]["reason"] == "no_valid_stored_session"
 
 
 def test_phase2_internal_routes_are_blocked_when_flag_false(client, auth_headers):

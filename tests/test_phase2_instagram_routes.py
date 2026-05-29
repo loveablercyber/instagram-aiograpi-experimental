@@ -13,6 +13,8 @@ from src.services.audit import AuditService
 from src.session_store import MemorySessionStore
 from conftest import TEST_TOKEN, make_settings
 
+MANUAL_CONFIRMATION = "RUN_ONE_MANUAL_LOGIN_ATTEMPT"
+
 
 @dataclass
 class FakeUser:
@@ -129,11 +131,16 @@ def test_login_saves_real_settings_encrypted_and_validate_restores():
         response = client.post(
             "/internal/instagram/login",
             headers={"X-Internal-Token": TEST_TOKEN},
-            json={"username": "secondary_test", "password": "temporary-password"},
+            json={
+                "username": "secondary_test",
+                "password": "temporary-password",
+                "confirmManualAttempt": MANUAL_CONFIRMATION,
+            },
         )
         validate = client.post("/internal/instagram/session/validate", headers={"X-Internal-Token": TEST_TOKEN})
 
     assert response.status_code == 200
+    assert response.json()["status"] == "success"
     assert validate.status_code == 200
     assert validate.json()["authenticated"] is True
     raw = store.documents["test_account_only"]
@@ -154,7 +161,11 @@ def test_login_can_use_render_configured_credentials_without_request_body_passwo
     app = create_app(settings=settings, session_store=store, audit=audit, instagram=instagram)
 
     with TestClient(app) as client:
-        response = client.post("/internal/instagram/login", headers={"X-Internal-Token": TEST_TOKEN}, json={})
+        response = client.post(
+            "/internal/instagram/login",
+            headers={"X-Internal-Token": TEST_TOKEN},
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
 
     assert response.status_code == 200
     assert "fake-real-sessionid-never-plaintext" not in str(store.documents["test_account_only"])
@@ -167,7 +178,11 @@ def test_threads_messages_send_and_send_rate_limit_are_controlled():
         client.post(
             "/internal/instagram/login",
             headers=headers,
-            json={"username": "secondary_test", "password": "temporary-password"},
+            json={
+                "username": "secondary_test",
+                "password": "temporary-password",
+                "confirmManualAttempt": MANUAL_CONFIRMATION,
+            },
         )
         threads = client.get("/internal/instagram/threads?amount=5", headers=headers)
         messages = client.get("/internal/instagram/threads/thread-1/messages?amount=10", headers=headers)

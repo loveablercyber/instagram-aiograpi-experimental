@@ -29,14 +29,29 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await audit.record("SERVICE_STARTED")
+        stored_session_available = False
+        try:
+            stored_session_available = await session_store.session_exists(settings.instagram_test_account_key)
+        except Exception:
+            stored_session_available = False
+        await audit.record(
+            "SERVICE_STARTED",
+            metadata={
+                "instagramRealConnectionEnabled": settings.instagram_real_connection_enabled,
+                "instagramPollingEnabled": settings.instagram_polling_enabled,
+                "instagramCredentialsConfigured": bool(settings.instagram_username and settings.instagram_password),
+                "instagramStoredSettingsAvailable": stored_session_available,
+                "instagramStoredSessionAvailable": stored_session_available,
+                "instagramPollingBlockedReason": _polling_blocked_reason(settings, stored_session_available),
+            },
+        )
         try:
             await session_store.ensure_indexes()
             connected = await session_store.ping()
             await audit.record("MONGODB_CONNECTED" if connected else "MONGODB_CONNECTION_FAILED")
         except Exception:
             await audit.record("MONGODB_CONNECTION_FAILED")
-        polling = PollingService(settings, audit)
+        polling = PollingService(settings, audit, session_store=session_store)
         await polling.start()
         app.state.polling = polling
         try:
@@ -60,6 +75,16 @@ def create_app(
     app.include_router(health_router)
     app.include_router(internal_router)
     return app
+
+
+def _polling_blocked_reason(settings: Settings, stored_session_available: bool) -> str | None:
+    if not settings.instagram_polling_enabled:
+        return "disabled_by_configuration"
+    if not settings.instagram_real_connection_enabled:
+        return "real_connection_disabled"
+    if not stored_session_available:
+        return "no_valid_stored_session"
+    return "requires_explicit_session_validation_before_start"
 
 
 def create_runtime_app() -> FastAPI:

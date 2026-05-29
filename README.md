@@ -2,7 +2,7 @@
 
 Microservico experimental e isolado para preparar uma POC de Instagram Direct com FastAPI, `aiograpi==1.0.9` e sessao criptografada em MongoDB Atlas.
 
-Esta fase nao conecta Instagram, nao faz login, nao envia mensagens e nao inicia polling.
+Esta fase nao deve executar login automaticamente, nao envia mensagens e nao inicia polling. A tentativa real de login, quando autorizada, deve ser manual, unica e diagnosticada por endpoint interno protegido.
 
 ## Escopo
 
@@ -20,8 +20,10 @@ Esta fase nao conecta Instagram, nao faz login, nao envia mensagens e nao inicia
 - `POST /internal/session/test-store`: protegido, salva settings ficticias criptografadas.
 - `POST /internal/session/test-restore`: protegido, valida restauracao sem retornar payload.
 - `DELETE /internal/session`: protegido, remove a sessao experimental ficticia quando o body confirma `REMOVE_EXPERIMENTAL_SESSION`.
+- `POST /internal/instagram/login`: protegido, exige `confirmManualAttempt=RUN_ONE_MANUAL_LOGIN_ATTEMPT`, polling desligado e conexao real habilitada.
+- `GET /internal/instagram/auth-attempts/latest`: protegido, retorna o ultimo diagnostico de autenticacao sanitizado.
 
-Nao existem endpoints de login, threads, mensagens, envio, midia, challenge ou logout real nesta fase.
+Endpoints de threads, mensagens, envio e logout real permanecem protegidos e dependem de sessao real validada. Nao habilitar polling nem tentar Direct enquanto a autenticacao inicial nao estiver classificada e validada.
 
 ## Variaveis
 

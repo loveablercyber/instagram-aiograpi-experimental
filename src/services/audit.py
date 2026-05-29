@@ -34,6 +34,7 @@ SAFE_EVENTS = {
     "LOGIN_CONSENT_REQUIRED",
     "LOGIN_GEOBLOCK_REQUIRED",
     "LOGIN_UNCLASSIFIED_FAILURE",
+    "LOGIN_BLOCKED_BY_AUTH_GUARD",
     "CHALLENGE_CONTEXT_STORED",
     "CHALLENGE_CONTEXT_NOT_PERSISTABLE",
     "VERIFICATION_CODE_SUBMITTED",
@@ -41,6 +42,7 @@ SAFE_EVENTS = {
     "VERIFICATION_FAILED",
     "VERIFICATION_RATE_LIMITED",
     "REAL_SESSION_ENCRYPTED_AND_STORED",
+    "AUTH_ATTEMPT_DIAGNOSTIC",
 }
 
 SENSITIVE_KEY_PARTS = (
@@ -51,6 +53,7 @@ SENSITIVE_KEY_PARTS = (
     "session",
     "settings",
     "authorization",
+    "credential",
     "mongodb_uri",
     "uri",
     "encryption",
@@ -63,7 +66,9 @@ def _safe_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key, value in metadata.items():
         lowered = key.lower()
-        if any(part in lowered for part in SENSITIVE_KEY_PARTS):
+        if isinstance(value, bool):
+            safe[key] = value
+        elif any(part in lowered for part in SENSITIVE_KEY_PARTS):
             safe[key] = "[REDACTED]"
         elif isinstance(value, (str, int, float, bool)) or value is None:
             safe[key] = value

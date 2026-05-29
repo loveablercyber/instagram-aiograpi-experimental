@@ -16,15 +16,20 @@ from aiograpi.exceptions import (
     ChallengeSelfieCaptcha,
     ChallengeUnknownStep,
     CheckpointRequired,
+    ClientConnectionError,
     ClientError,
+    ClientForbiddenError,
     ClientLoginRequired,
+    ClientRequestTimeout,
     ClientThrottledError,
+    ClientUnauthorizedError,
     ConsentRequired,
     FeedbackRequired,
     GeoBlockRequired,
     LegacyForceSetNewPasswordForm,
     LoginRequired,
     PleaseWaitFewMinutes,
+    RateLimitError,
     RecaptchaChallengeForm,
     SelectContactPointRecoveryForm,
     SentryBlock,
@@ -33,6 +38,13 @@ from aiograpi.exceptions import (
     UnknownError,
 )
 
+from src.auth_diagnostics import (
+    InstagramAuthDiagnosticResult,
+    diagnostic_from_exception,
+    diagnostic_success,
+    new_attempt_id,
+    utc_now_iso,
+)
 from src.config import Settings
 from src.services.audit import AuditService
 from src.session_store import MemorySessionStore, MongoSessionStore, SessionStoreError
@@ -226,6 +238,38 @@ class InstagramClientService:
         except Exception:
             return None
 
+    async def latest_auth_attempt(self) -> dict[str, Any] | None:
+        return await self.session_store.latest_auth_attempt(self.settings.instagram_test_account_key)
+
+    async def _save_auth_diagnostic(self, diagnostic: InstagramAuthDiagnosticResult) -> None:
+        await self.session_store.save_auth_attempt(
+            self.settings.instagram_test_account_key,
+            diagnostic.to_public_dict(),
+        )
+        await self.audit.record(
+            "AUTH_ATTEMPT_DIAGNOSTIC",
+            account_key=self.settings.instagram_test_account_key,
+            metadata={
+                "attemptId": diagnostic.attempt_id,
+                "status": diagnostic.status,
+                "exceptionClass": diagnostic.exception_class,
+                "httpStatus": diagnostic.http_status,
+                "hasChallengeContext": diagnostic.has_challenge_context,
+                "hasTwoFactorIdentifier": diagnostic.has_two_factor_identifier,
+                "hasCheckpointUrl": diagnostic.has_checkpoint_url,
+            },
+        )
+
+    async def blocked_auth_diagnostic(self, reason: str) -> InstagramAuthDiagnosticResult:
+        diagnostic = InstagramAuthDiagnosticResult.blocked(reason)
+        await self.audit.record(
+            "LOGIN_BLOCKED_BY_AUTH_GUARD",
+            account_key=self.settings.instagram_test_account_key,
+            metadata={"attemptId": diagnostic.attempt_id, "reason": reason},
+        )
+        await self._save_auth_diagnostic(diagnostic)
+        return diagnostic
+
     def _classify_challenge(self, exc: Exception) -> str:
         if isinstance(exc, TwoFactorRequired):
             return "two_factor"
@@ -337,6 +381,157 @@ class InstagramClientService:
             "LOGIN_UNCLASSIFIED_FAILURE",
         )
 
+    def _diagnostic_for_exception(
+        self,
+        *,
+        attempt_id: str,
+        exc: Exception,
+        client: Any,
+    ) -> tuple[InstagramAuthDiagnosticResult, str]:
+        if isinstance(exc, TwoFactorRequired):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="two_factor_required",
+                    safe_message="Instagram requires two-factor verification.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_TWO_FACTOR_REQUIRED",
+            )
+        if isinstance(exc, (ChallengeRequired, ChallengeRedirection, SelectContactPointRecoveryForm)):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="challenge_required",
+                    safe_message="Instagram requires a manual challenge step.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_CHALLENGE_REQUIRED",
+            )
+        if isinstance(
+            exc,
+            (
+                CheckpointRequired,
+                ChallengeSelfieCaptcha,
+                CaptchaChallengeRequired,
+                RecaptchaChallengeForm,
+                SubmitPhoneNumberForm,
+                ChallengeUnknownStep,
+                LegacyForceSetNewPasswordForm,
+            ),
+        ):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="checkpoint_required",
+                    safe_message="Instagram requires manual account action before another login attempt.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_CHECKPOINT_REQUIRED",
+            )
+        if isinstance(exc, (BadPassword, BadCredentials)):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="invalid_credentials",
+                    safe_message="Instagram rejected the credentials or login context.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
+            )
+        if isinstance(
+            exc,
+            (
+                FeedbackRequired,
+                PleaseWaitFewMinutes,
+                ClientForbiddenError,
+                ClientThrottledError,
+                SentryBlock,
+                RateLimitError,
+                ClientUnauthorizedError,
+                ClientLoginRequired,
+                LoginRequired,
+            ),
+        ):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="blocked",
+                    safe_message="Instagram blocked or rate-limited the authentication flow.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_FEEDBACK_REQUIRED",
+            )
+        if isinstance(exc, ConsentRequired):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="blocked",
+                    safe_message="Instagram requires consent or account review before login can continue.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_CONSENT_REQUIRED",
+            )
+        if isinstance(exc, GeoBlockRequired):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="blocked",
+                    safe_message="Instagram rejected the login because of geoblocking or network context.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=True,
+                    retry_allowed=False,
+                ),
+                "LOGIN_GEOBLOCK_REQUIRED",
+            )
+        if isinstance(exc, (ClientConnectionError, ClientRequestTimeout)):
+            return (
+                diagnostic_from_exception(
+                    attempt_id=attempt_id,
+                    status="transport_error",
+                    safe_message="The Instagram request failed at the transport layer.",
+                    exc=exc,
+                    client=client,
+                    requires_manual_action=False,
+                    retry_allowed=False,
+                ),
+                "LOGIN_UNCLASSIFIED_FAILURE",
+            )
+        return (
+            diagnostic_from_exception(
+                attempt_id=attempt_id,
+                status="unknown_error",
+                safe_message=(
+                    "Instagram returned an unclassified authentication response. "
+                    "Review the sanitized diagnostic before any new attempt."
+                ),
+                exc=exc,
+                client=client,
+                requires_manual_action=True,
+                retry_allowed=False,
+            ),
+            "LOGIN_UNCLASSIFIED_FAILURE",
+        )
+
     def _raise_safe_provider_error(self, exc: Exception) -> None:
         if isinstance(exc, (TwoFactorRequired, ChallengeRequired)):
             raise InstagramChallengeRequiredError(self._classify_challenge(exc)) from exc
@@ -440,6 +635,88 @@ class InstagramClientService:
             session_stored=True,
             next_action="validate_session",
         )
+
+    async def login_diagnostic_future(
+        self,
+        username: str,
+        password: str,
+        challenge_data: dict[str, Any] | None = None,
+    ) -> InstagramAuthDiagnosticResult:
+        await self._block_real_connection("login")
+        if not username or not password:
+            return await self.blocked_auth_diagnostic("Instagram username and password are required")
+        challenge_data = challenge_data or {}
+        verification_code = challenge_data.get("verificationCode") or challenge_data.get("code") or ""
+        settings_payload = challenge_data.get("settingsPayload")
+        attempt_id = new_attempt_id()
+        client = self._new_client(settings_payload=settings_payload, challenge_code=verification_code)
+        await self.audit.record(
+            "LOGIN_ATTEMPT_STARTED",
+            account_key=self.settings.instagram_test_account_key,
+            metadata={"attemptId": attempt_id},
+        )
+        try:
+            logged_in = await self._run_silently(
+                client.login(username=username, password=password, verification_code=verification_code)
+            )
+        except Exception as exc:
+            diagnostic, audit_event = self._diagnostic_for_exception(attempt_id=attempt_id, exc=exc, client=client)
+            challenge_type = self._classify_challenge(exc)
+            if diagnostic.status in {"challenge_required", "two_factor_required"}:
+                await self._set_pending_context(client, challenge_type)
+            await self.audit.record(
+                audit_event,
+                account_key=self.settings.instagram_test_account_key,
+                metadata={
+                    "attemptId": diagnostic.attempt_id,
+                    "classification": diagnostic.status,
+                    "exceptionClass": diagnostic.exception_class,
+                    "httpStatus": diagnostic.http_status,
+                    "hasChallengeContext": diagnostic.has_challenge_context,
+                    "hasTwoFactorIdentifier": diagnostic.has_two_factor_identifier,
+                    "hasCheckpointUrl": diagnostic.has_checkpoint_url,
+                },
+            )
+            await self._save_auth_diagnostic(diagnostic)
+            return diagnostic
+        if not logged_in:
+            diagnostic = InstagramAuthDiagnosticResult(
+                attempt_id=attempt_id,
+                created_at=utc_now_iso(),
+                status="invalid_credentials",
+                exception_class=None,
+                safe_message="Instagram rejected the credentials or login context.",
+                http_status=None,
+                response_message=None,
+                response_error_type=None,
+                has_challenge_context=False,
+                has_two_factor_identifier=False,
+                has_checkpoint_url=False,
+                has_session=False,
+                has_settings=bool(client.get_settings()),
+                requires_manual_action=True,
+                retry_allowed=False,
+                raw_response_sanitized={},
+            )
+            await self.audit.record(
+                "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
+                account_key=self.settings.instagram_test_account_key,
+                metadata={"attemptId": attempt_id, "classification": diagnostic.status},
+            )
+            await self._save_auth_diagnostic(diagnostic)
+            return diagnostic
+        await self.save_session_to_store(self.settings.instagram_test_account_key, client.get_settings())
+        self._client = client
+        await self._clear_pending_context()
+        diagnostic = diagnostic_success(attempt_id=attempt_id, client=client)
+        await self.audit.record(
+            "LOGIN_SUCCEEDED",
+            account_key=self.settings.instagram_test_account_key,
+            metadata={"attemptId": attempt_id},
+        )
+        await self.audit.record("REAL_SESSION_ENCRYPTED_AND_STORED", account_key=self.settings.instagram_test_account_key)
+        await self._save_auth_diagnostic(diagnostic)
+        return diagnostic
 
     async def resolve_challenge_future(
         self,

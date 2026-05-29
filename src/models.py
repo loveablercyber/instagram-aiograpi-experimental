@@ -31,6 +31,7 @@ class InstagramLoginRequest(BaseModel):
     username: str | None = None
     password: SecretStr | None = None
     verificationCode: SecretStr | None = None
+    confirmManualAttempt: str | None = None
 
 
 class InstagramChallengeResolveRequest(BaseModel):
@@ -61,6 +62,33 @@ class InstagramAuthResponse(BaseModel):
     verificationType: str | None = None
     challengeMethod: str | None = None
     reason: str | None = None
+
+
+class InstagramAuthDiagnosticResponse(BaseModel):
+    attempt_id: str
+    created_at: str
+    status: str
+    exception_class: str | None = None
+    safe_message: str
+    http_status: int | None = None
+    response_message: str | None = None
+    response_error_type: str | None = None
+    has_challenge_context: bool
+    has_two_factor_identifier: bool
+    has_checkpoint_url: bool
+    has_session: bool
+    has_settings: bool
+    requires_manual_action: bool
+    retry_allowed: bool
+    raw_response_sanitized: dict
+    library_name: str
+    library_version: str
+
+
+class InstagramAuthAttemptLatestResponse(BaseModel):
+    found: bool
+    diagnostic: InstagramAuthDiagnosticResponse | None = None
+    recommendation: str
 
 
 class InstagramSessionValidateResponse(BaseModel):

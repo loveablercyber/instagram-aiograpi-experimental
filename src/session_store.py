@@ -67,6 +67,10 @@ class MongoSessionStore:
         await collection.create_index([("accountKey", ASCENDING)], unique=True, name="unique_account_key")
         await collection.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0, name="verification_expires_at")
         await self.audit_collection().create_index([("createdAt", ASCENDING)], name="audit_created_at")
+        await self.audit_collection().create_index(
+            [("event", ASCENDING), ("accountKey", ASCENDING), ("createdAt", ASCENDING)],
+            name="audit_event_account_created_at",
+        )
         await self.message_collection().create_index(
             [("accountKey", ASCENDING), ("messageId", ASCENDING)],
             unique=True,
@@ -179,6 +183,28 @@ class MongoSessionStore:
         result = await self.session_collection().delete_one({"accountKey": _verification_context_key(account_key)})
         return result.deleted_count > 0
 
+    async def save_auth_attempt(self, account_key: str, diagnostic: dict[str, Any]) -> None:
+        now = datetime.now(UTC)
+        await self.audit_collection().insert_one(
+            {
+                "event": "AUTH_ATTEMPT_DIAGNOSTIC",
+                "accountKey": account_key,
+                "diagnostic": diagnostic,
+                "createdAt": now,
+            }
+        )
+
+    async def latest_auth_attempt(self, account_key: str) -> dict[str, Any] | None:
+        document = await self.audit_collection().find_one(
+            {"event": "AUTH_ATTEMPT_DIAGNOSTIC", "accountKey": account_key},
+            sort=[("createdAt", -1)],
+            projection={"_id": 0},
+        )
+        if not document:
+            return None
+        diagnostic = document.get("diagnostic")
+        return diagnostic if isinstance(diagnostic, dict) else None
+
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:
         return await self.session_collection().find_one({"accountKey": account_key})
 
@@ -197,6 +223,7 @@ class MemorySessionStore:
         self.documents: dict[str, dict[str, Any]] = {}
         self.audit_documents: list[dict[str, Any]] = []
         self.message_documents: list[dict[str, Any]] = []
+        self.auth_attempt_documents: list[dict[str, Any]] = []
         self.connected = True
 
     async def ping(self) -> bool:
@@ -292,6 +319,23 @@ class MemorySessionStore:
 
     async def delete_verification_context(self, account_key: str) -> bool:
         return self.documents.pop(_verification_context_key(account_key), None) is not None
+
+    async def save_auth_attempt(self, account_key: str, diagnostic: dict[str, Any]) -> None:
+        self.auth_attempt_documents.append(
+            {
+                "event": "AUTH_ATTEMPT_DIAGNOSTIC",
+                "accountKey": account_key,
+                "diagnostic": diagnostic,
+                "createdAt": datetime.now(UTC),
+            }
+        )
+
+    async def latest_auth_attempt(self, account_key: str) -> dict[str, Any] | None:
+        for document in reversed(self.auth_attempt_documents):
+            if document.get("accountKey") == account_key:
+                diagnostic = document.get("diagnostic")
+                return diagnostic if isinstance(diagnostic, dict) else None
+        return None
 
     async def raw_document_for_tests(self, account_key: str) -> dict[str, Any] | None:
         return self.documents.get(account_key)

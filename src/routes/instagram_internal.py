@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
+from src.auth_diagnostics import auth_status_http_code
 from src.config import Settings
 from src.dependencies import require_internal_auth
 from src.instagram_client import (
@@ -16,6 +18,8 @@ from src.instagram_client import (
 )
 from src.models import (
     InstagramActionResponse,
+    InstagramAuthAttemptLatestResponse,
+    InstagramAuthDiagnosticResponse,
     InstagramAuthResponse,
     InstagramChallengeResolveRequest,
     InstagramLoginRequest,
@@ -35,6 +39,7 @@ from src.services.rate_limit import RateLimitExceeded
 router = APIRouter(prefix="/internal", dependencies=[Depends(require_internal_auth)])
 
 REMOVE_CONFIRMATION = "REMOVE_EXPERIMENTAL_SESSION"
+MANUAL_LOGIN_CONFIRMATION = "RUN_ONE_MANUAL_LOGIN_ATTEMPT"
 
 FAKE_SETTINGS: dict[str, Any] = {
     "device_settings": {
@@ -82,6 +87,13 @@ def _safe_instagram_exception(exc: Exception) -> HTTPException:
 
 def _auth_flow_response(exc: InstagramAuthFlowError) -> InstagramAuthResponse:
     return InstagramAuthResponse(**exc.result.to_response())
+
+
+def _auth_diagnostic_response(diagnostic) -> JSONResponse:
+    return JSONResponse(
+        status_code=auth_status_http_code(diagnostic.status),
+        content=diagnostic.to_public_dict(),
+    )
 
 
 @router.get("/status", response_model=InternalStatusResponse)
@@ -153,28 +165,57 @@ async def delete_session(request: Request, body: RemoveSessionRequest) -> Sessio
     return SessionActionResponse(ok=removed, action="delete", accountKey=settings.instagram_test_account_key)
 
 
-@router.post("/instagram/login", response_model=InstagramAuthResponse)
-async def instagram_login(request: Request, body: InstagramLoginRequest) -> InstagramAuthResponse:
+@router.post("/instagram/login", response_model=InstagramAuthDiagnosticResponse)
+async def instagram_login(request: Request, body: InstagramLoginRequest):
     settings = _settings(request)
     _ensure_test_phase(settings)
     instagram = request.app.state.instagram
+    if not settings.instagram_real_connection_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Real Instagram connection is disabled")
+    if body.confirmManualAttempt != MANUAL_LOGIN_CONFIRMATION:
+        diagnostic = await instagram.blocked_auth_diagnostic(
+            "Manual login requires confirmManualAttempt=RUN_ONE_MANUAL_LOGIN_ATTEMPT"
+        )
+        return _auth_diagnostic_response(diagnostic)
+    if settings.instagram_polling_enabled:
+        diagnostic = await instagram.blocked_auth_diagnostic("Polling must be disabled before a login attempt")
+        return _auth_diagnostic_response(diagnostic)
     username = body.username or settings.instagram_username
     password = body.password.get_secret_value() if body.password else settings.instagram_password
     if not username or not password:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Instagram credentials are not configured")
+        diagnostic = await instagram.blocked_auth_diagnostic("Instagram credentials are not configured")
+        return _auth_diagnostic_response(diagnostic)
     try:
-        result = await instagram.login_future(
+        diagnostic = await instagram.login_diagnostic_future(
             username,
             password,
             {
                 "verificationCode": body.verificationCode.get_secret_value() if body.verificationCode else "",
             },
         )
-    except InstagramAuthFlowError as exc:
-        return _auth_flow_response(exc)
     except Exception as exc:
         raise _safe_instagram_exception(exc) from exc
-    return InstagramAuthResponse(**result.to_response())
+    return _auth_diagnostic_response(diagnostic)
+
+
+@router.get("/instagram/auth-attempts/latest", response_model=InstagramAuthAttemptLatestResponse)
+async def instagram_latest_auth_attempt(request: Request) -> InstagramAuthAttemptLatestResponse:
+    instagram = request.app.state.instagram
+    latest = await instagram.latest_auth_attempt()
+    if not latest:
+        return InstagramAuthAttemptLatestResponse(
+            found=False,
+            diagnostic=None,
+            recommendation="No Instagram authentication attempt has been recorded.",
+        )
+    recommendation = "Review the sanitized diagnostic before any new manual attempt."
+    if latest.get("status") == "success":
+        recommendation = "Validate the restored session before using Direct endpoints."
+    elif latest.get("status") in {"challenge_required", "two_factor_required"}:
+        recommendation = "Submit the verification code only through the protected verification endpoint."
+    elif latest.get("status") in {"unknown_error", "checkpoint_required", "blocked"}:
+        recommendation = "Do not retry automatically; inspect the Instagram app, e-mail, account state, and network context first."
+    return InstagramAuthAttemptLatestResponse(found=True, diagnostic=latest, recommendation=recommendation)
 
 
 async def _resolve_verification(request: Request, body: InstagramChallengeResolveRequest) -> InstagramAuthResponse:

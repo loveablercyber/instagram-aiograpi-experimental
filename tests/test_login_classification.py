@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+
 from aiograpi.exceptions import (
     BadPassword,
     ChallengeRequired,
     CheckpointRequired,
+    ClientForbiddenError,
     TwoFactorRequired,
     UnknownError,
 )
 from fastapi.testclient import TestClient
 
 from src.app import create_app
+from src.auth_diagnostics import sanitize_instagram_auth_payload
 from src.config import Settings
 from src.instagram_client import InstagramClientService
 from src.security.encryption import EncryptionService
 from src.services.audit import AuditService
 from src.session_store import MemorySessionStore
 from conftest import TEST_TOKEN, make_settings
+
+MANUAL_CONFIRMATION = "RUN_ONE_MANUAL_LOGIN_ATTEMPT"
 
 
 class RaisingClient:
@@ -57,22 +63,21 @@ def _client_for_exception(exception_class):
 def _login_response(exception_class):
     client, audit, store = _client_for_exception(exception_class)
     with client:
-        response = client.post("/internal/instagram/login", headers={"X-Internal-Token": TEST_TOKEN}, json={})
+        response = client.post(
+            "/internal/instagram/login",
+            headers={"X-Internal-Token": TEST_TOKEN},
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
     return response, audit, store
 
 
 def test_two_factor_required_returns_sanitized_verification_status():
     response, audit, store = _login_response(TwoFactorRequired)
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "verification_required",
-        "nextAction": "submit_verification_code",
-        "sessionStored": None,
-        "verificationType": "two_factor",
-        "challengeMethod": None,
-        "reason": None,
-    }
+    assert response.status_code == 409
+    assert response.json()["status"] == "two_factor_required"
+    assert response.json()["requires_manual_action"] is True
+    assert response.json()["retry_allowed"] is False
     assert any(event["event"] == "LOGIN_TWO_FACTOR_REQUIRED" for event in audit.memory_events)
     assert "fake-sessionid-sensitive" not in str(store.documents)
 
@@ -80,19 +85,18 @@ def test_two_factor_required_returns_sanitized_verification_status():
 def test_challenge_required_returns_sanitized_challenge_status():
     response, audit, _store = _login_response(ChallengeRequired)
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "verification_required"
-    assert response.json()["verificationType"] == "challenge"
-    assert response.json()["challengeMethod"] == "email_or_sms_or_unknown"
+    assert response.status_code == 409
+    assert response.json()["status"] == "challenge_required"
+    assert response.json()["requires_manual_action"] is True
     assert any(event["event"] == "LOGIN_CHALLENGE_REQUIRED" for event in audit.memory_events)
 
 
 def test_checkpoint_required_returns_manual_action_required():
     response, audit, _store = _login_response(CheckpointRequired)
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "manual_action_required"
-    assert response.json()["reason"] == "checkpoint_or_login_confirmation"
+    assert response.status_code == 409
+    assert response.json()["status"] == "checkpoint_required"
+    assert response.json()["safe_message"] == "Instagram requires manual account action before another login attempt."
     assert any(event["event"] == "LOGIN_CHECKPOINT_REQUIRED" for event in audit.memory_events)
 
 
@@ -100,9 +104,9 @@ def test_bad_password_returns_context_rejected_without_sensitive_detail():
     response, audit, _store = _login_response(BadPassword)
     body = str(response.json())
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "authentication_rejected"
-    assert response.json()["reason"] == "credentials_or_login_context_rejected"
+    assert response.status_code == 401
+    assert response.json()["status"] == "invalid_credentials"
+    assert response.json()["safe_message"] == "Instagram rejected the credentials or login context."
     assert "temporary-password" not in body
     assert "fake-sessionid-sensitive" not in body
     assert any(event["event"] == "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED" for event in audit.memory_events)
@@ -111,12 +115,21 @@ def test_bad_password_returns_context_rejected_without_sensitive_detail():
 def test_unknown_error_returns_unclassified_sanitized_status():
     response, audit, _store = _login_response(UnknownError)
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "authentication_failed_unclassified"
-    assert response.json()["reason"] == "sanitized_unclassified_instagram_response"
+    assert response.status_code == 409
+    assert response.json()["status"] == "unknown_error"
+    assert response.json()["safe_message"].startswith("Instagram returned an unclassified")
     event = next(event for event in audit.memory_events if event["event"] == "LOGIN_UNCLASSIFIED_FAILURE")
     assert event["metadata"]["exceptionClass"] == "UnknownError"
     assert "challengeType" not in event["metadata"]
+
+
+def test_client_forbidden_returns_blocked_diagnostic():
+    response, audit, _store = _login_response(ClientForbiddenError)
+
+    assert response.status_code == 409
+    assert response.json()["status"] == "blocked"
+    assert response.json()["requires_manual_action"] is True
+    assert any(event["event"] == "LOGIN_FEEDBACK_REQUIRED" for event in audit.memory_events)
 
 
 def test_verification_endpoint_rejects_missing_token(client):
@@ -128,12 +141,16 @@ def test_verification_endpoint_rejects_missing_token(client):
 def test_verification_endpoint_blocks_more_than_two_attempts(auth_headers):
     client, _audit, store = _client_for_exception(TwoFactorRequired)
     with client:
-        login_response = client.post("/internal/instagram/login", headers=auth_headers, json={})
+        login_response = client.post(
+            "/internal/instagram/login",
+            headers=auth_headers,
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
         first = client.post("/internal/instagram/verification/two-factor", headers=auth_headers, json={"code": "111111"})
         second = client.post("/internal/instagram/verification/two-factor", headers=auth_headers, json={"code": "222222"})
         third = client.post("/internal/instagram/verification/two-factor", headers=auth_headers, json={"code": "333333"})
 
-    assert login_response.json()["status"] == "verification_required"
+    assert login_response.json()["status"] == "two_factor_required"
     assert first.json()["status"] == "verification_failed"
     assert second.json()["status"] == "verification_failed"
     assert third.json()["status"] == "verification_failed"
@@ -162,3 +179,76 @@ def test_direct_endpoints_are_blocked_without_valid_session(auth_headers):
     assert threads.status_code == 401
     assert messages.status_code == 401
     assert send.status_code == 401
+
+
+def test_login_requires_manual_confirmation(auth_headers):
+    client, audit, _store = _client_for_exception(UnknownError)
+    with client:
+        response = client.post("/internal/instagram/login", headers=auth_headers, json={})
+
+    assert response.status_code == 409
+    assert response.json()["status"] == "blocked"
+    assert response.json()["retry_allowed"] is False
+    assert any(event["event"] == "LOGIN_BLOCKED_BY_AUTH_GUARD" for event in audit.memory_events)
+
+
+def test_latest_auth_attempt_endpoint_returns_sanitized_diagnostic(auth_headers):
+    client, _audit, _store = _client_for_exception(UnknownError)
+    with client:
+        client.post(
+            "/internal/instagram/login",
+            headers=auth_headers,
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
+        latest = client.get("/internal/instagram/auth-attempts/latest", headers=auth_headers)
+
+    assert latest.status_code == 200
+    assert latest.json()["found"] is True
+    assert latest.json()["diagnostic"]["status"] == "unknown_error"
+    assert "fake-sessionid-sensitive" not in str(latest.json())
+
+
+def test_failed_login_does_not_overwrite_existing_session(auth_headers):
+    client, _audit, store = _client_for_exception(UnknownError)
+    existing = {"cookies": {"sessionid": "existing-valid-session"}, "device_settings": {"uuid": "existing-device"}}
+    with client:
+        asyncio.run(store.save_settings("test_account_only", existing))
+        before = dict(store.documents["test_account_only"])
+        response = client.post(
+            "/internal/instagram/login",
+            headers=auth_headers,
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
+
+    assert response.json()["status"] == "unknown_error"
+    assert store.documents["test_account_only"]["encryptedSettings"] == before["encryptedSettings"]
+
+
+def test_sanitize_instagram_auth_payload_removes_secrets():
+    payload = {
+        "message": "challenge_required for user@example.com",
+        "error_type": "unknown",
+        "password": "secret-password",
+        "cookies": {"sessionid": "full-session-id", "csrftoken": "csrf-token"},
+        "authorization": "Bearer secret",
+        "challenge": {
+            "challenge_context": "opaque-context",
+            "phone": "+5511999999999",
+            "email": "user@example.com",
+        },
+        "two_factor_info": {"two_factor_identifier": "identifier-secret"},
+        "device_id": "android-secret-device",
+        "uuid": "uuid-secret",
+    }
+
+    sanitized = sanitize_instagram_auth_payload(payload)
+    body = str(sanitized)
+
+    assert "secret-password" not in body
+    assert "full-session-id" not in body
+    assert "csrf-token" not in body
+    assert "identifier-secret" not in body
+    assert "android-secret-device" not in body
+    assert "uuid-secret" not in body
+    assert "[EMAIL_REDACTED]" in body
+    assert sanitized["challenge"]["challenge_context"] == "[PRESENT]"
