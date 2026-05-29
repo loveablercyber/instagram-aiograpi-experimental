@@ -43,6 +43,7 @@ from src.auth_diagnostics import (
     diagnostic_from_exception,
     diagnostic_success,
     new_attempt_id,
+    redact_diagnostic,
     utc_now_iso,
 )
 from src.config import Settings
@@ -398,6 +399,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_TWO_FACTOR_REQUIRED",
             )
@@ -411,6 +413,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_CHALLENGE_REQUIRED",
             )
@@ -435,6 +438,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_CHECKPOINT_REQUIRED",
             )
@@ -448,6 +452,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_BAD_PASSWORD_OR_CONTEXT_REJECTED",
             )
@@ -474,6 +479,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_FEEDBACK_REQUIRED",
             )
@@ -487,6 +493,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_CONSENT_REQUIRED",
             )
@@ -500,6 +507,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=True,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_GEOBLOCK_REQUIRED",
             )
@@ -513,6 +521,7 @@ class InstagramClientService:
                     client=client,
                     requires_manual_action=False,
                     retry_allowed=False,
+                    sensitive_values=(self.settings.instagram_username,),
                 ),
                 "LOGIN_UNCLASSIFIED_FAILURE",
             )
@@ -528,6 +537,7 @@ class InstagramClientService:
                 client=client,
                 requires_manual_action=True,
                 retry_allowed=False,
+                sensitive_values=(self.settings.instagram_username,),
             ),
             "LOGIN_UNCLASSIFIED_FAILURE",
         )
@@ -708,7 +718,10 @@ class InstagramClientService:
         await self.save_session_to_store(self.settings.instagram_test_account_key, client.get_settings())
         self._client = client
         await self._clear_pending_context()
-        diagnostic = diagnostic_success(attempt_id=attempt_id, client=client)
+        diagnostic = redact_diagnostic(
+            diagnostic_success(attempt_id=attempt_id, client=client),
+            sensitive_values=(self.settings.instagram_username,),
+        )
         await self.audit.record(
             "LOGIN_SUCCEEDED",
             account_key=self.settings.instagram_test_account_key,

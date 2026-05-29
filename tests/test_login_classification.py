@@ -26,13 +26,16 @@ MANUAL_CONFIRMATION = "RUN_ONE_MANUAL_LOGIN_ATTEMPT"
 
 class RaisingClient:
     exception_class = Exception
+    exception_kwargs = {}
 
     def __init__(self, settings=None, proxy=None, logger=None):
         self.settings_payload = settings or {}
         self.challenge_code_handler = None
+        self.last_json = {}
+        self.last_response = None
 
     async def login(self, username=None, password=None, verification_code=""):
-        raise self.exception_class("sanitized test exception")
+        raise self.exception_class("sanitized test exception", **self.exception_kwargs)
 
     def get_settings(self):
         return {
@@ -47,6 +50,25 @@ def _client_for_exception(exception_class):
         pass
 
     SpecificRaisingClient.exception_class = exception_class
+    settings: Settings = make_settings(
+        instagram_real_connection_enabled=True,
+        instagram_username="secondary_test",
+        instagram_password="temporary-password",
+    )
+    encryption = EncryptionService(settings.session_encryption_key)
+    store = MemorySessionStore(settings, encryption)
+    audit = AuditService()
+    instagram = InstagramClientService(settings, store, audit, client_factory=SpecificRaisingClient)
+    app = create_app(settings=settings, session_store=store, audit=audit, instagram=instagram)
+    return TestClient(app), audit, store
+
+
+def _client_for_exception_kwargs(exception_class, exception_kwargs):
+    class SpecificRaisingClient(RaisingClient):
+        pass
+
+    SpecificRaisingClient.exception_class = exception_class
+    SpecificRaisingClient.exception_kwargs = exception_kwargs
     settings: Settings = make_settings(
         instagram_real_connection_enabled=True,
         instagram_username="secondary_test",
@@ -206,6 +228,30 @@ def test_latest_auth_attempt_endpoint_returns_sanitized_diagnostic(auth_headers)
     assert latest.json()["found"] is True
     assert latest.json()["diagnostic"]["status"] == "unknown_error"
     assert "fake-sessionid-sensitive" not in str(latest.json())
+
+
+def test_latest_auth_attempt_redacts_configured_username(auth_headers):
+    client, _audit, _store = _client_for_exception_kwargs(
+        UnknownError,
+        {
+            "message": "We can't find an account with secondary_test.",
+            "error_type": "invalid_user",
+            "status": "fail",
+        },
+    )
+    with client:
+        login = client.post(
+            "/internal/instagram/login",
+            headers=auth_headers,
+            json={"confirmManualAttempt": MANUAL_CONFIRMATION},
+        )
+        latest = client.get("/internal/instagram/auth-attempts/latest", headers=auth_headers)
+
+    assert login.status_code == 409
+    assert "secondary_test" not in str(login.json())
+    assert latest.status_code == 200
+    assert "secondary_test" not in str(latest.json())
+    assert "ACCOUNT_IDENTIFIER_REDACTED" in str(latest.json())
 
 
 def test_failed_login_does_not_overwrite_existing_session(auth_headers):

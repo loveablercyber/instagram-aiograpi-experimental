@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from src.auth_diagnostics import auth_status_http_code
+from src.auth_diagnostics import auth_status_http_code, sanitize_diagnostic_dict
 from src.config import Settings
 from src.dependencies import require_internal_auth
 from src.instagram_client import (
@@ -208,6 +208,8 @@ async def instagram_latest_auth_attempt(request: Request) -> InstagramAuthAttemp
             diagnostic=None,
             recommendation="No Instagram authentication attempt has been recorded.",
         )
+    settings = _settings(request)
+    latest = sanitize_diagnostic_dict(latest, sensitive_values=(settings.instagram_username,))
     recommendation = "Review the sanitized diagnostic before any new manual attempt."
     if latest.get("status") == "success":
         recommendation = "Validate the restored session before using Direct endpoints."

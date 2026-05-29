@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata as metadata
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -116,7 +116,12 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def sanitize_instagram_auth_payload(payload: Any, *, depth: int = 0) -> Any:
+def sanitize_instagram_auth_payload(
+    payload: Any,
+    *,
+    depth: int = 0,
+    sensitive_values: tuple[str, ...] = (),
+) -> Any:
     if depth > 5:
         return "[MAX_DEPTH]"
     if isinstance(payload, dict):
@@ -124,19 +129,28 @@ def sanitize_instagram_auth_payload(payload: Any, *, depth: int = 0) -> Any:
         for key, value in payload.items():
             key_str = str(key)
             lowered = key_str.lower()
-            if any(part in lowered for part in SENSITIVE_KEY_PARTS):
+            if lowered.startswith("has_") and isinstance(value, bool):
+                safe[key_str] = value
+            elif any(part in lowered for part in SENSITIVE_KEY_PARTS):
                 safe[key_str] = "[REDACTED]"
             elif any(part in lowered for part in PRESENCE_ONLY_KEY_PARTS):
                 safe[key_str] = "[PRESENT]" if value not in (None, "", [], {}) else None
             elif key_str in IMPORTANT_KEYS or isinstance(value, (dict, list, tuple, str, int, float, bool)) or value is None:
-                safe[key_str] = sanitize_instagram_auth_payload(value, depth=depth + 1)
+                safe[key_str] = sanitize_instagram_auth_payload(
+                    value,
+                    depth=depth + 1,
+                    sensitive_values=sensitive_values,
+                )
             else:
                 safe[key_str] = str(type(value).__name__)
         return safe
     if isinstance(payload, (list, tuple)):
-        return [sanitize_instagram_auth_payload(item, depth=depth + 1) for item in payload[:20]]
+        return [
+            sanitize_instagram_auth_payload(item, depth=depth + 1, sensitive_values=sensitive_values)
+            for item in payload[:20]
+        ]
     if isinstance(payload, str):
-        return _sanitize_text(payload)
+        return _sanitize_text(payload, sensitive_values=sensitive_values)
     if isinstance(payload, (int, float, bool)) or payload is None:
         return payload
     return str(type(payload).__name__)
@@ -170,12 +184,13 @@ def diagnostic_from_exception(
     client: Any | None,
     requires_manual_action: bool,
     retry_allowed: bool,
+    sensitive_values: tuple[str, ...] = (),
 ) -> InstagramAuthDiagnosticResult:
     payload = build_exception_payload(exc, client)
-    sanitized = sanitize_instagram_auth_payload(_important_payload(payload))
+    sanitized = sanitize_instagram_auth_payload(_important_payload(payload), sensitive_values=sensitive_values)
     http_status = _http_status_from_payload(payload)
-    response_message = _safe_value(payload.get("message"))
-    response_error_type = _safe_value(payload.get("error_type"))
+    response_message = _safe_value(payload.get("message"), sensitive_values=sensitive_values)
+    response_error_type = _safe_value(payload.get("error_type"), sensitive_values=sensitive_values)
     settings_payload = _safe_get_settings(client)
     return InstagramAuthDiagnosticResult(
         attempt_id=attempt_id,
@@ -232,18 +247,51 @@ def auth_status_http_code(status: str) -> int:
     }.get(status, 502)
 
 
+def sanitize_diagnostic_dict(
+    diagnostic: dict[str, Any],
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    sanitized = sanitize_instagram_auth_payload(diagnostic, sensitive_values=sensitive_values)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def redact_diagnostic(
+    diagnostic: InstagramAuthDiagnosticResult,
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> InstagramAuthDiagnosticResult:
+    return replace(
+        diagnostic,
+        safe_message=_sanitize_text(diagnostic.safe_message, sensitive_values=sensitive_values),
+        response_message=_sanitize_text(diagnostic.response_message, sensitive_values=sensitive_values)
+        if diagnostic.response_message
+        else None,
+        response_error_type=_sanitize_text(diagnostic.response_error_type, sensitive_values=sensitive_values)
+        if diagnostic.response_error_type
+        else None,
+        raw_response_sanitized=sanitize_instagram_auth_payload(
+            diagnostic.raw_response_sanitized,
+            sensitive_values=sensitive_values,
+        ),
+    )
+
+
 def _important_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key in IMPORTANT_KEYS}
 
 
-def _safe_value(value: Any) -> str | None:
+def _safe_value(value: Any, *, sensitive_values: tuple[str, ...] = ()) -> str | None:
     if value in (None, ""):
         return None
-    return str(sanitize_instagram_auth_payload(str(value)))[:240]
+    return str(sanitize_instagram_auth_payload(str(value), sensitive_values=sensitive_values))[:240]
 
 
-def _sanitize_text(value: str) -> str:
+def _sanitize_text(value: str, *, sensitive_values: tuple[str, ...] = ()) -> str:
     text = value[:1000]
+    for sensitive in sensitive_values:
+        if sensitive:
+            text = text.replace(sensitive, "[ACCOUNT_IDENTIFIER_REDACTED]")
     text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[EMAIL_REDACTED]", text)
     text = re.sub(r"\b\d{5,}\b", "[NUMBER_REDACTED]", text)
     text = re.sub(r"(?i)(sessionid|csrftoken|authorization|password|token)=([^;\s]+)", r"\1=[REDACTED]", text)

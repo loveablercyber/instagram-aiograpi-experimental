@@ -196,7 +196,11 @@ class MongoSessionStore:
 
     async def latest_auth_attempt(self, account_key: str) -> dict[str, Any] | None:
         document = await self.audit_collection().find_one(
-            {"event": "AUTH_ATTEMPT_DIAGNOSTIC", "accountKey": account_key},
+            {
+                "event": "AUTH_ATTEMPT_DIAGNOSTIC",
+                "accountKey": account_key,
+                "diagnostic": {"$exists": True},
+            },
             sort=[("createdAt", -1)],
             projection={"_id": 0},
         )
