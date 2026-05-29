@@ -28,6 +28,8 @@ class RaisingClient:
     exception_class = Exception
     exception_kwargs = {}
     public_profile_exists = True
+    public_exception_class = None
+    public_head_status = 200
     login_calls = 0
 
     def __init__(self, settings=None, proxy=None, logger=None):
@@ -41,11 +43,19 @@ class RaisingClient:
         raise self.exception_class("sanitized test exception", **self.exception_kwargs)
 
     async def user_info_by_username_gql(self, username):
+        if self.public_exception_class is not None:
+            raise self.public_exception_class("public check blocked")
         if not self.public_profile_exists:
             from aiograpi.exceptions import UserNotFound
 
             raise UserNotFound("User not found")
         return {"pk": "123", "username": username}
+
+    async def public_head(self, url, follow_redirects=False):
+        Response = type("Response", (), {})
+        response = Response()
+        response.status_code = self.public_head_status
+        return response
 
     def get_settings(self):
         return {
@@ -61,6 +71,8 @@ def _client_for_exception(exception_class):
 
     SpecificRaisingClient.exception_class = exception_class
     SpecificRaisingClient.login_calls = 0
+    SpecificRaisingClient.public_exception_class = None
+    SpecificRaisingClient.public_profile_exists = True
     settings: Settings = make_settings(
         instagram_real_connection_enabled=True,
         instagram_username="secondary_test",
@@ -81,6 +93,8 @@ def _client_for_exception_kwargs(exception_class, exception_kwargs):
     SpecificRaisingClient.exception_class = exception_class
     SpecificRaisingClient.exception_kwargs = exception_kwargs
     SpecificRaisingClient.login_calls = 0
+    SpecificRaisingClient.public_exception_class = None
+    SpecificRaisingClient.public_profile_exists = True
     settings: Settings = make_settings(
         instagram_real_connection_enabled=True,
         instagram_username="secondary_test",
@@ -279,6 +293,20 @@ def test_account_preflight_uses_public_profile_without_login(auth_headers):
     assert response.json()["login_attempt_performed"] is False
     assert response.json()["username_redacted"] == "se***st"
     assert client.app.state.instagram._client_factory.login_calls == 0
+
+
+def test_account_preflight_falls_back_to_public_profile_url(auth_headers):
+    client, _audit, _store = _client_for_exception(UnknownError)
+    factory = client.app.state.instagram._client_factory
+    factory.public_exception_class = ClientForbiddenError
+    factory.public_head_status = 200
+
+    with client:
+        response = client.get("/internal/instagram/account/preflight", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["public_profile_exists"] is True
+    assert "Public profile URL responded successfully" in response.json()["safe_interpretation"]
 
 
 def test_latest_auth_attempt_correlates_public_preflight_and_private_invalid_user(auth_headers):

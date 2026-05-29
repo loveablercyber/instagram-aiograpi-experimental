@@ -250,7 +250,7 @@ class InstagramClientService:
         return await self.session_store.latest_account_preflight(self.settings.instagram_test_account_key)
 
     async def account_preflight_future(self, username: str) -> dict[str, Any]:
-        username = (username or "").strip()
+        username = (username or "").strip().lstrip("@").lower()
         redacted = redact_identifier(username)
         checked_at = utc_now_iso()
         if not username:
@@ -281,16 +281,9 @@ class InstagramClientService:
                 "before any new private login attempt."
             )
         except (ClientForbiddenError, ClientThrottledError, ClientBadRequestError, ClientConnectionError, ClientRequestTimeout):
-            public_profile_exists = None
-            safe_interpretation = (
-                "Public profile preflight was inconclusive because Instagram rejected or blocked the public check. "
-                "This is not proof that the profile does not exist."
-            )
+            public_profile_exists, safe_interpretation = await self._fallback_public_profile_url_check(client, username)
         except Exception:
-            public_profile_exists = None
-            safe_interpretation = (
-                "Public profile preflight was inconclusive. This is not proof that the profile does not exist."
-            )
+            public_profile_exists, safe_interpretation = await self._fallback_public_profile_url_check(client, username)
         result = {
             "username_redacted": redacted,
             "public_profile_exists": public_profile_exists,
@@ -314,6 +307,34 @@ class InstagramClientService:
             },
         )
         return result
+
+    async def _fallback_public_profile_url_check(self, client: Any, username: str) -> tuple[bool | None, str]:
+        try:
+            response = await self._run_silently(
+                client.public_head(f"https://www.instagram.com/{username}/", follow_redirects=False)
+            )
+            status_code = getattr(response, "status_code", None)
+        except Exception:
+            return (
+                None,
+                "Public profile preflight was inconclusive because Instagram rejected or blocked the public checks. "
+                "This is not proof that the profile does not exist.",
+            )
+        if status_code == 200:
+            return (
+                True,
+                "Public profile URL responded successfully. This does not validate private login; Instagram may still "
+                "reject the private authentication context, device, IP, session, or flow.",
+            )
+        if status_code == 404:
+            return (
+                False,
+                "Public profile URL returned not found. Verify the identifier manually before any new private login attempt.",
+            )
+        return (
+            None,
+            "Public profile URL check was inconclusive. This is not proof that the profile does not exist.",
+        )
 
     async def _save_auth_diagnostic(self, diagnostic: InstagramAuthDiagnosticResult) -> None:
         await self.session_store.save_auth_attempt(
