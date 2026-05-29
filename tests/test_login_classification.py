@@ -114,7 +114,9 @@ def test_unknown_error_returns_unclassified_sanitized_status():
     assert response.status_code == 200
     assert response.json()["status"] == "authentication_failed_unclassified"
     assert response.json()["reason"] == "sanitized_unclassified_instagram_response"
-    assert any(event["event"] == "LOGIN_UNCLASSIFIED_FAILURE" for event in audit.memory_events)
+    event = next(event for event in audit.memory_events if event["event"] == "LOGIN_UNCLASSIFIED_FAILURE")
+    assert event["metadata"]["exceptionClass"] == "UnknownError"
+    assert "challengeType" not in event["metadata"]
 
 
 def test_verification_endpoint_rejects_missing_token(client):

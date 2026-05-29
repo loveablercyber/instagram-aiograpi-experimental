@@ -404,10 +404,16 @@ class InstagramClientService:
             challenge_type = self._classify_challenge(exc)
             if result.status == "verification_required":
                 await self._set_pending_context(client, challenge_type)
+            metadata = {
+                "classification": result.status,
+                "exceptionClass": type(exc).__name__,
+            }
+            if result.status == "verification_required":
+                metadata["challengeType"] = challenge_type
             await self.audit.record(
                 audit_event,
                 account_key=self.settings.instagram_test_account_key,
-                metadata={"classification": result.status, "challengeType": challenge_type},
+                metadata=metadata,
             )
             raise InstagramAuthFlowError(result) from exc
         if not logged_in:
